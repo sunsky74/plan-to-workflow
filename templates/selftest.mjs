@@ -209,6 +209,25 @@ const runTpl = async (args, implOut) => {
     return await fn(runs, args);
 };
 {
+    // A5: lite 只派总门禁 A —— 把模板副本里的 MODE 改掉再跑同一套假 runs
+    const liteSrc = TPL_SRC.replace('const MODE = "standard";', 'const MODE = "lite";');
+    ok('模板的 MODE 常量可被替换（测试自身有效性）', liteSrc !== TPL_SRC);
+    const log = [];
+    const fn = new Function('runs', 'args', 'return (async () => {' + liteSrc + '})()');
+    const runs = {
+        all: async (specs) => {
+            for (const x of specs) log.push(x.key);
+            return specs.map((x) => ({ ok: true, output: x.key.includes('-gate-') ? 'VERDICT: PASS' : 'STATUS: DONE' }));
+        }
+    };
+    const lastStage = ['s1', 's2', 's3', 's4'].filter((x) => TPL_SRC.includes(x)).pop() || 's1';
+    await fn(runs, { manualDone: ['M1', 'M2', 'M3', 'M4', 'M5'] });
+    const finals = log.filter((k) => k.startsWith('final-'));
+    ok('lite 模式不派总门禁 B', !finals.includes('final-b'), '派了: ' + finals.join(','));
+    ok('lite 模式仍派总门禁 A', finals.includes('final-a'), '派了: ' + finals.join(','));
+}
+
+{
     // T8: fromStage 认层内任意成员。只认 wave[0] 时，传层内其它 stage 会静默跳过整条链。
     const r = await runTpl({ fromStage: 's3', manualDone: ['M1'] }, 'STATUS: DONE');
     // progress 行现在是 4 列表格：| 时刻 | stage | 结果 | 备注 |
@@ -487,6 +506,36 @@ const runTpl = async (args, implOut) => {
     ok('手写变体缺解析器被判 C11', /解析器块缺失/.test(r.out));
 }
 
+// T22 C12：lite 模式的边界
+{
+    const mk = (name, stages, kind) => {
+        const d = fixture(name, { rules: 'full', dispatch: 'timeout', stages });
+        fs.appendFileSync(path.join(d, 'wf.js'),
+            '\nconst MODE = "lite";\nconst STAGE_TIMEOUT_TIER = { skeleton: 10, mechanical: 15, verify: 12, feature: 25 };\n' +
+            'const STAGE_KIND = {' + kind + '};\n');
+        return d;
+    };
+
+    const d1 = mk('lite-4stage',
+        { s1: '范围：tasks.md 1.1 a', s2: '范围：tasks.md 1.2 b', s3: '范围：tasks.md 1.3 c', s4: '范围：tasks.md 1.4 d' },
+        's1: "skeleton", s2: "mechanical", s3: "verify", s4: "skeleton"');
+    fs.writeFileSync(path.join(d1, 'wf.js'),
+        fs.readFileSync(path.join(d1, 'wf.js'), 'utf8').replace('const WAVES = [\n    ["s1"],\n];', 'const WAVES = [\n    ["s1"],\n];'));
+    const r1 = cov(d1, false);
+    ok('C12 lite 超过 3 个 stage 被拦住', r1.code === 1 && /lite 不满足适用条件/.test(r1.out),
+        r1.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+    const d2 = mk('lite-feature', { s1: '范围：tasks.md 1.1 a' }, 's1: "feature"');
+    const r2 = cov(d2, false);
+    ok('C12 lite 含 feature 档被拦住', r2.code === 1 && /kind 含 feature/.test(r2.out),
+        r2.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+    const d3 = mk('lite-ok', { s1: '范围：tasks.md 1.1 a' }, 's1: "mechanical"');
+    const r3 = cov(d3, false);
+    ok('C12 lite 合规时通过', r3.code === 0 && /MODE=lite 且未越界/.test(r3.out),
+        r3.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+}
+
 // T20 C10：STAGE_KIND 取值与登记
 {
     const d = fixture('kind-bad', { rules: 'full', dispatch: 'timeout' });
@@ -574,6 +623,9 @@ ok('模板 revTask 传轮次', /revTask\(g\.stage, g\.output, round\)/.test(tplJ
 ok('模板 revTask 传授权范围', /STAGES\[stage\]/.test(tplJs));
 ok('模板有异常兜底（try/catch + failure）', /catch \(e\)/.test(tplJs) && /failure: failure/.test(tplJs));
 ok('模板 return 带幂等提醒', /不幂等/.test(tplJs));
+ok('模板提供 MODE 常量且 lite 跳过总门禁 B', /const MODE = "standard"/.test(tplJs) && /MODE === "lite" \? gspecs\.slice\(0, 1\)/.test(tplJs));
+ok('SKILL.md 判定卡含「模式」行', /模式: 标准 \| 轻量/.test(skill));
+ok('coverage 有 C12 lite 边界检查', /C12 lite 模式的适用边界/.test(fs.readFileSync(path.join(HERE, 'coverage.mjs'), 'utf8')));
 ok('模板发 stage-start/stage-end 事件且守卫 emit', /typeof emit !== "function"/.test(tplJs) && /notify\("stage-end"/.test(tplJs));
 ok('模板 progress 行是 4 列表格', /\"| \" \+ stamp\(\)/.test(tplJs) || /return \"\| \" \+ stamp/.test(tplJs));
 ok('SKILL.md 要求用 append-progress 记账', /append-progress\.mjs/.test(skill) && /不手改|不要手改/.test(skill));

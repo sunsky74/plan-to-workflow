@@ -32,6 +32,11 @@ const MODEL_GATE = "<provider/model-gate-id>"; // 必须与 worker 不同族或�
 const STAGE_MODEL = {};
 const MAX_ROUNDS = 2;
 
+// 执行模式。lite 只对「单仓、少量文件、无 DDL/生产配置」的小改动开放，
+// 换来的是：只跑总门禁 A、冷审 1 轮、判定卡与编排表一次确认。
+// 越界会被 coverage 的 C12 拦下 —— 省掉的那部分检查是有代价的，不能随手省。
+const MODE = "standard"; // "standard" | "lite" 
+
 // 每次派发的时间上限。**必须有**：没有它，一个卡住的 worker 只会被人工发现，实测代价 49 分钟／次。
 // checkpointBeforeDeadlineMs 让子 agent 在到点前结账并汇报，于是「卡住」变成「超时 + 有部分结论」。
 //
@@ -369,7 +374,7 @@ function notify(type, stage, round, extra) {
 const resumed = {};       // 每个 stage 的实现只允许续跑一次
 const gateResumed = {};    // 每个 stage 的门禁只允许超时重派一次
 const unknownRetried = {}; // 每个 stage 的门禁只允许「格式重派」一次
-const report = { halted: false, reason: "", waves: [], progress: [], resumes: [], nextManual: "", at: "" };
+const report = { halted: false, mode: MODE, reason: "", waves: [], progress: [], resumes: [], nextManual: "", at: "" };
 
 // 异常兜底：provider / API / 参数被拒 / 运行时错误都要留下「死在哪、哪些过了」。
 // 没有这层，脚本一抛错连 return 都到不了，report.progress 全丢（failureKind 会记成 script）。
@@ -596,10 +601,13 @@ for (let wi = 0; wi < WAVES.length; wi++) {
 
 // ════════════════ 双总门禁（只有整条跑完才做） ════════════════
 if (!report.halted) {
-    const gs = await runs.all([
+    const gspecs = [
         { key: "final-a", agent: "reviewer", model: MODEL_GATE, label: "总门禁A 规格符合性", maxRuntimeMs: GATE_TIMEOUT_MS, task: finalGateTask("A-规格符合性") },
         { key: "final-b", agent: "reviewer", model: MODEL_GATE, label: "总门禁B 对抗性", maxRuntimeMs: GATE_TIMEOUT_MS, task: finalGateTask("B-对抗性") }
-    ]);
+    ];
+    // lite 只跑总门禁 A：对抗性那关的产出主要用于大改动的边界找漏，
+    // 小改动上它的收益抵不过一次完整派发。
+    const gs = await runs.all(MODE === "lite" ? gspecs.slice(0, 1) : gspecs);
     finalGates = gs.map(function (g, i) {
         return {
             gate: i === 0 ? "A-规格符合性" : "B-对抗性",
@@ -630,6 +638,7 @@ return {
     manualText: report.nextManual ? MANUAL[report.nextManual] : "",
     waves: report.waves,
     finalGates: finalGates,
+    mode: report.mode,
     progress: report.progress,
     resumes: report.resumes, // 编排方逐行追加进 <change>/progress.md，并自己补时间戳
     // ⚠️ 续跑粒度是「层」不是 stage：同层已 PASS 的 stage 会被重跑，而写操作通常不幂等。

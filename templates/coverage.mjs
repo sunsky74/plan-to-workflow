@@ -290,6 +290,55 @@ function checkDispatchContract(wsrc) {
         }
     }
 
+    // C12 lite 模式的适用边界：省掉的检查是有代价的，越界就必须回标准模式
+    {
+        const mode = (wsrc.match(/const\s+MODE\s*=\s*["']([\w-]+)["']/) || [])[1] || 'standard';
+        if (mode !== 'lite') {
+            console.log(`  ✓ 模式: ${mode}`);
+        } else {
+            const stagesBlk = (wsrc.match(/const\s+STAGES\s*=\s*\{([\s\S]*?)\n\};/) || [])[1] || '';
+            const stageKeys = [...stagesBlk.matchAll(/^\s*["']?([\w-]+)["']?\s*:\s*\[/gm)].map((m) => m[1]);
+            const kindBlk2 = (wsrc.match(/const\s+STAGE_KIND\s*=\s*\{([\s\S]*?)\n?\};/) || [])[1] || '';
+            const kindVals = [...kindBlk2.matchAll(/["']?([\w-]+)["']?\s*:\s*["']([\w-]+)["']/g)].map((m) => m[2]);
+            const ALLOWED = ['skeleton', 'mechanical', 'verify'];
+            const bad6 = kindVals.filter((k) => !ALLOWED.includes(k));
+            // 自己算仓根（C6 的 rootsOf 在另一段作用域里，不可直接复用）
+            const cp = { REPO: '' };
+            for (const m2 of wsrc.matchAll(/const\s+(\w+)\s*=\s*REPO\s*\+\s*"([^"]*)"/g)) cp[m2[1]] = m2[2];
+            const rootOfPath = (q) => {
+                const seg = String(q).replace(/^\/+/, '').split('/').filter(Boolean);
+                if (!seg.length) return '(根仓)';
+                return seg[0] === 'ops' || seg[0] === 'tsp' || seg[0] === 'app' ? seg.slice(0, 2).join('/') : seg[0];
+            };
+            const roots = new Set();
+            for (const k of stageKeys) {
+                const body = (wsrc.match(new RegExp('\\b' + k + '\\s*:\\s*\\[([\\s\\S]*?)\\]\\.join')) || [])[1] || '';
+                const scope = (body.match(/授权范围[：:]\s*([^\n"']*)/) || [])[1] || '';
+                const found = new Set();
+                for (const nm of Object.keys(cp)) {
+                    if (nm === 'REPO') continue;
+                    if (new RegExp('\\b' + nm + '\\b').test(scope)) found.add(rootOfPath(cp[nm]));
+                }
+                for (const m3 of scope.matchAll(/(?:^|[^A-Za-z0-9_.-])((?:ops|tsp|app)\/[\w.-]+)/g)) found.add(rootOfPath(m3[1]));
+                if (!found.size) found.add('(根仓)');
+                for (const r of found) roots.add(r);
+            }
+
+            const errs = [];
+            if (stageKeys.length > 3) errs.push(`stage ${stageKeys.length} 个 > 3`);
+            if (bad6.length) errs.push(`kind 含 ${[...new Set(bad6)].join('/')}（lite 只允许 ${ALLOWED.join('/')}）`);
+            if (roots.size > 1) errs.push(`跨 ${roots.size} 个仓（${[...roots].join(', ')}）`);
+            if (errs.length) {
+                console.log(`  ✗ MODE=lite 但越界: ${errs.join('；')}`);
+                problems.push(
+                    `MODE=lite 不满足适用条件（${errs.join('；')}）→ 换成 standard，或把改动拆小`
+                );
+            } else {
+                console.log(`  ✓ MODE=lite 且未越界（${stageKeys.length} stage / 单仓 / kind 合规）`);
+            }
+        }
+    }
+
     // C8 每个派发点的选项对象必须带超时
     const MAX_TIMEOUT_MS = 25 * 60 * 1000;
     const dispatch = [];
