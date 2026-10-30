@@ -1,0 +1,1 @@
+自检：cd tsp/tsp-alert-center && mvn -s settings -o install -DskipTests 并贴 BUILD SUCCESS；再以 test profile 启动 service 上下文并记录结果；贴 grep 证据证明两处 yml 的端口与 basename 值
