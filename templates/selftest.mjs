@@ -409,6 +409,33 @@ const runTpl = async (args, implOut) => {
         `code=${r.code} ` + r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
 }
 
+// T20 C10：STAGE_KIND 取值与登记
+{
+    const d = fixture('kind-bad', { rules: 'full', dispatch: 'timeout' });
+    fs.appendFileSync(path.join(d, 'wf.js'),
+        '\nconst STAGE_TIMEOUT_TIER = { skeleton: 10, feature: 25 };\nconst STAGE_KIND = { s1: "skelton" };\n');
+    const r = cov(d, false);
+    ok('C10 拦住非法 STAGE_KIND 取值', r.code === 1 && /STAGE_KIND 取值非法/.test(r.out),
+        r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+    const d2 = fixture('kind-missing', { rules: 'full', dispatch: 'timeout' });
+    fs.appendFileSync(path.join(d2, 'wf.js'),
+        '\nconst STAGE_TIMEOUT_TIER = { skeleton: 10, feature: 25 };\nconst STAGE_KIND = { };\n');
+    const r2 = cov(d2, false);
+    ok('C10 未登记的 stage 只警告不阻断', r2.code === 0 && /没登记 STAGE_KIND/.test(r2.out),
+        `code=${r2.code}`);
+}
+
+// T21 C8：硬编码超时 > 25 分钟要拦（分档的意义就在于不许随手写大数）
+{
+    const d = fixture('tmo-long', { rules: 'full', dispatch: 'timeout' });
+    fs.appendFileSync(path.join(d, 'wf.js'),
+        '\nconst SPEC2 = [{ key: "y", agent: "worker", model: MODEL_WORKER, maxRuntimeMs: 90 * 60 * 1000, task: "t" }];\n');
+    const r = cov(d, false);
+    ok('C8 拦住 > 25 分钟的超时字面量', r.code === 1 && /25 分钟的超时字面量/.test(r.out),
+        r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+}
+
 // T16: 派发契约 —— RULES 缺「验证预算」要拦住（子 agent 转圈的根因）
 {
     const d = fixture('rules-partial', { rules: 'partial', dispatch: 'timeout' });
@@ -469,11 +496,15 @@ ok('模板 revTask 传轮次', /revTask\(g\.stage, g\.output, round\)/.test(tplJ
 ok('模板 revTask 传授权范围', /STAGES\[stage\]/.test(tplJs));
 ok('模板有异常兜底（try/catch + failure）', /catch \(e\)/.test(tplJs) && /failure: failure/.test(tplJs));
 ok('模板 return 带幂等提醒', /不幂等/.test(tplJs));
+ok('模板按档位取超时（STAGE_TIMEOUT_TIER + STAGE_KIND）', /STAGE_TIMEOUT_TIER/.test(tplJs) && /timeoutMsOf\(s\)/.test(tplJs) && /GATE_TIMEOUT_MS/.test(tplJs));
+ok('模板超时后自动续跑一次', /resumed\[s\]/.test(tplJs) && /-resume/.test(tplJs));
+ok('模板门禁超时重派一次', /gateResumed\[g\.stage\]/.test(tplJs));
+ok('SKILL.md 编排表有「类型」列并解释超时分档', /\*\*类型\*\*决定/.test(skill) && /STAGE_TIMEOUT_TIER/.test(skill));
 ok('模板 RULES 指向 run-bounded.sh', /run-bounded\.sh/.test(tplJs));
 ok('画像第 1 项含「有界执行工具」', /有界执行工具/.test(profileT));
 ok('SKILL.md 规定 stage 自检不得起常驻进程', /不得要求启动常驻进程/.test(skill));
 ok('run-bounded.sh 已随 skill 分发', fs.existsSync(path.join(HERE, 'bin', 'run-bounded.sh')));
-ok('模板内置派发超时', /maxRuntimeMs: STAGE_TIMEOUT_MS/.test(tplJs) && /checkpointBeforeDeadlineMs/.test(tplJs));
+ok('模板内置派发超时（按档位）', /maxRuntimeMs: budget\.ms/.test(tplJs) && /checkpointBeforeDeadlineMs: budget\.checkpoint/.test(tplJs) && /GATE_TIMEOUT_MS/.test(tplJs));
 ok('SKILL.md 记录了子 agent 自转圈的两道闸', /自证验证器/.test(skill) && /maxRuntimeMs/.test(skill));
 ok('模板提供 STAGE_MODEL 正门', /const STAGE_MODEL = \{\};/.test(tplJs) && /STAGE_MODEL\[s\] \|\| MODEL_WORKER/.test(tplJs));
 ok('SKILL.md 要求 plan.md 落盘', /plan\.md/.test(skill) && /scope:/.test(skill));

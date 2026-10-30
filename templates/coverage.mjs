@@ -234,7 +234,34 @@ function checkDispatchContract(wsrc) {
         console.log('  ✓ 未发现常驻命令');
     }
 
+    // C10 STAGE_KIND 必须取合法值，且每个 stage 都登记（缺省 feature，缺了就警告）
+    {
+        const tierBlk = (wsrc.match(/const\s+STAGE_TIMEOUT_TIER\s*=\s*\{([\s\S]*?)\};/) || [])[1] || '';
+        const kindBlk = (wsrc.match(/const\s+STAGE_KIND\s*=\s*\{([\s\S]*?)\};/) || [])[1];
+        const stagesBlk = (wsrc.match(/const\s+STAGES\s*=\s*\{([\s\S]*?)\n\};/) || [])[1] || '';
+        if (!tierBlk) {
+            console.log('  ! 未找到 STAGE_TIMEOUT_TIER → C10 跳过');
+        } else {
+            const kinds = [...tierBlk.matchAll(/(\w+)\s*:\s*\d+/g)].map((m) => m[1]);
+            const declared = kindBlk === undefined ? null : [...kindBlk.matchAll(/["']?([\w-]+)["']?\s*:\s*["']([\w-]+)["']/g)];
+            const bad = (declared || []).filter((m) => !kinds.includes(m[2]));
+            if (bad.length) {
+                console.log(`  ✗ STAGE_KIND 取值非法: ${bad.map((m) => m[1] + '=' + m[2]).join(', ')}（合法: ${kinds.join('/')}）`);
+                problems.push(`STAGE_KIND 有 ${bad.length} 处取值不在 STAGE_TIMEOUT_TIER 里 → 会静默退到 feature 档`);
+            }
+            const stageKeys = [...stagesBlk.matchAll(/^\s*["']?([\w-]+)["']?\s*:\s*\[/gm)].map((m) => m[1]);
+            const undeclared = stageKeys.filter((k) => !(declared || []).some((m) => m[1] === k));
+            if (stageKeys.length && undeclared.length) {
+                console.log(`  ! ${undeclared.length} 个 stage 没登记 STAGE_KIND（按 feature 档）: ${undeclared.slice(0, 6).join(', ')}`);
+                warnings.push(`${undeclared.length} 个 stage 未登记 STAGE_KIND → 一律按 feature 25 分钟，可能过长或过短`);
+            } else if (stageKeys.length) {
+                console.log(`  ✓ ${stageKeys.length} 个 stage 的 STAGE_KIND 都合法`);
+            }
+        }
+    }
+
     // C8 每个派发点的选项对象必须带超时
+    const MAX_TIMEOUT_MS = 25 * 60 * 1000;
     const dispatch = [];
     for (const m of wsrc.matchAll(/\bagent\s*:\s*["']/g)) {
         const start = wsrc.lastIndexOf('{', m.index);
@@ -247,7 +274,18 @@ function checkDispatchContract(wsrc) {
         if (end < 0) continue;
         const obj = wsrc.slice(start, end + 1);
         const line = wsrc.slice(0, start).split('\n').length;
-        dispatch.push({ line, hasTimeout: /(?:maxRuntimeMs|timeoutMs)\s*:/.test(obj) });
+        const tm = obj.match(/(?:maxRuntimeMs|timeoutMs)\s*:\s*([^,\n}]+)/);
+        let tooLong = false;
+        if (tm) {
+            const expr = tm[1].trim();
+            // 只判字面量：STAGE_TIMEOUT_TIER 这类表达式由 C10 管
+            const mm = expr.match(/^(\d+)\s*\*?\s*(\d*)\s*\*?\s*(\d*)$/);
+            if (mm) {
+                const v = Number(mm[1]) * (Number(mm[2]) || 1) * (Number(mm[3]) || 1);
+                if (Number.isFinite(v) && v > MAX_TIMEOUT_MS) tooLong = true;
+            }
+        }
+        dispatch.push({ line, hasTimeout: Boolean(tm), tooLong });
     }
     if (!dispatch.length) {
         console.log('  ! 未识别到派发点（可能用了自定义派发路径），C8 跳过');
@@ -261,6 +299,13 @@ function checkDispatchContract(wsrc) {
             );
         } else {
             console.log(`  ✓ ${dispatch.length} 个派发点都带超时`);
+        }
+        const tooLong = dispatch.filter((d) => d.tooLong);
+        if (tooLong.length) {
+            console.log(`  ✗ ${tooLong.length} 个派发点超时字面量 > 25 分钟（行 ${tooLong.map((d) => d.line).join(', ')}）`);
+            problems.push(
+                `${tooLong.length} 个派发点写了 > 25 分钟的超时字面量 → 卡住一次的代价不可接受。按 STAGE_TIMEOUT_TIER 取档位`
+            );
         }
     }
 }
