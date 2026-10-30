@@ -447,7 +447,17 @@ RESULT_JSON: {"verdict":"PASS","p0":0}
 | 账 | 谁写 | 内容 |
 |---|---|---|
 | `<change>/tasks.md` 的 `- [x]` | **人**（意图） | 哪些任务认为做完了 |
-| `<change>/progress.md` | **机器**（事实） | `progress` 数组逐行追加 |
+| `<change>/progress.md` | **机器**（事实） | workflow 返回的 `progress` 行，**用脚本追加，不手改** |
+
+记账走脚本，不走复制粘贴：
+
+```bash
+node templates/append-progress.mjs <change 目录> <status.json>
+```
+
+它按「时刻 + stage + 结果」去重，所以同一个 `status.json` 跑两次不会写重复行；行本身已经是 4 列表格，`coverage` 的台账检查能直接解析。手改一次就会开始漂移——漏行、改格式、同一段贴两遍，三种都遇过。
+
+**运行中**：每收到一个子任务完成通知，就在回复里给用户一行状态（stage、轮次、PASS/FAIL、一句话原因），不要攒到最后一次性汇报。攒着的代价是——卡住时没人知道，等到人问起已经过了 49 分钟。
 
 `progress.md` 用表格，一行一个 stage 或人工段：
 

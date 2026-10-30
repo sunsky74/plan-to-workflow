@@ -56,6 +56,7 @@ function injectImpl(failStages, seenMap, key) {
 }
 
 async function run(label, args, failStages) {
+    const events = [];
     for (const k of Object.keys(seen)) delete seen[k];
     for (const k of Object.keys(seenG)) delete seenG[k];
     const log = [];
@@ -96,7 +97,7 @@ async function run(label, args, failStages) {
     };
     let r, err = null;
     try {
-        r = await fn(runs, args);
+        r = await fn(runs, args, (ev) => events.push(ev));
     } catch (e) {
         err = e;
         r = { halted: 'THREW', reason: e.message, progress: [] };
@@ -110,6 +111,7 @@ async function run(label, args, failStages) {
         halted: r.halted,
         nextManual: r.nextManual || '',
         resumes: r.resumes || [],
+        events,
         reason: String(r.reason || ''),
         err
     };
@@ -191,6 +193,17 @@ results.push(await run('门禁首次 UNKNOWN → 重派 → PASS', { fromStage: 
 const res5 = results[results.length - 1];
 if (res5.halted) bad.push('门禁 UNKNOWN 重派后仍停机：' + (res5.reason || ''));
 if (!(res5.resumes || []).some((x) => x.reason === 'gate-unknown')) bad.push('UNKNOWN 没有触发格式重派');
+
+// —— A4 进度事件必须成对，且不留悬空的 stage-start
+{
+    const paid = results.filter((r) => r.label.includes('全新开跑') || r.label.includes('门禁超时'));
+    for (const r of paid) {
+        const starts = r.events.filter((e) => e.type === 'stage-start').map((e) => e.stage);
+        const ends = r.events.filter((e) => e.type === 'stage-end').map((e) => e.stage);
+        if (starts.length !== ends.length) bad.push(`${r.label}: stage-start ${starts.length} 个 / stage-end ${ends.length} 个`);
+        for (const s of new Set(starts)) if (!ends.includes(s) && !r.halted) bad.push(`${r.label}: ${s} 有 start 无 end`);
+    }
+}
 
 console.log('\n' + (bad.length ? '✗ 干跑发现问题:\n  - ' + bad.join('\n  - ') : '✓ 干跑通过：跳层、人工段放行、门禁收敛、BLOCKED 停机都符合预期'));
 process.exit(bad.length ? 1 : 0);

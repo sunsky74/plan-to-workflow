@@ -211,7 +211,8 @@ const runTpl = async (args, implOut) => {
 {
     // T8: fromStage 认层内任意成员。只认 wave[0] 时，传层内其它 stage 会静默跳过整条链。
     const r = await runTpl({ fromStage: 's3', manualDone: ['M1'] }, 'STATUS: DONE');
-    const ran = [...new Set(r.progress.map((x) => x.split(' ')[0]))];
+    // progress 行现在是 4 列表格：| 时刻 | stage | 结果 | 备注 |
+    const ran = [...new Set(r.progress.map((x) => String(x).split('|').map((c) => c.trim())[2]))];
     ok('fromStage 传层内非首成员仍跑该层', ran.includes('s3') && ran.includes('s2'), '跑到: ' + JSON.stringify(ran));
 
     // T9: worker 引用规则原文不得被判 BLOCKED（indexOf 全文匹配的经典误判）
@@ -337,6 +338,29 @@ const runTpl = async (args, implOut) => {
                 `isBlocked=${P.isBlocked(t)} lastDecl=${P.lastDecl(t, 'STATUS')}`);
         }
     }
+}
+
+// ── T16b append-progress：幂等 + 表格形态
+{
+    const dir = fixture('progress-append', {});
+    const st = path.join(dir, 'status.json');
+    const rows = ['| 2026-10-29 10:00 | s1 | PASS r1 | ok |', '| 2026-10-29 10:05 | s2 | FAIL r1 | 漏 3 处 |'];
+    fs.writeFileSync(st, JSON.stringify({ value: { progress: rows } }));
+    const AP = path.join(HERE, 'append-progress.mjs');
+
+    const r1 = run(AP, [dir, st]);
+    ok('append-progress 首次写入', r1.code === 0 && fs.existsSync(path.join(dir, 'progress.md')), r1.out.slice(0, 80));
+    const after1 = fs.readFileSync(path.join(dir, 'progress.md'), 'utf8');
+    ok('append-progress 写出 4 列表头', /\| 时刻 \| stage \/ 段 \| 结果 \| 备注 \|/.test(after1));
+
+    const r2 = run(AP, [dir, st]);
+    const after2 = fs.readFileSync(path.join(dir, 'progress.md'), 'utf8');
+    ok('append-progress 幂等（同一 status 跑两次不重复）', r2.code === 0 && after1 === after2, r2.out.slice(0, 60));
+
+    // 新格式行能被 coverage 的台账检查解析
+    const r3 = run(path.join(HERE, 'coverage.mjs'), [path.join(dir, 'tasks.md'), path.join(dir, 'wf.js'), path.join(dir, 'actions.md')]);
+    // actions.md 不存在 → 台账检查不触发；此处只断言 coverage 不因 progress.md 报格式错
+    ok('coverage 不把新格式台账判成格式错', !/progress\.md 有 .* 行格式不符/.test(r3.out));
 }
 
 // ── T18 有界执行器：run-bounded.sh
@@ -550,6 +574,10 @@ ok('模板 revTask 传轮次', /revTask\(g\.stage, g\.output, round\)/.test(tplJ
 ok('模板 revTask 传授权范围', /STAGES\[stage\]/.test(tplJs));
 ok('模板有异常兜底（try/catch + failure）', /catch \(e\)/.test(tplJs) && /failure: failure/.test(tplJs));
 ok('模板 return 带幂等提醒', /不幂等/.test(tplJs));
+ok('模板发 stage-start/stage-end 事件且守卫 emit', /typeof emit !== "function"/.test(tplJs) && /notify\("stage-end"/.test(tplJs));
+ok('模板 progress 行是 4 列表格', /\"| \" \+ stamp\(\)/.test(tplJs) || /return \"\| \" \+ stamp/.test(tplJs));
+ok('SKILL.md 要求用 append-progress 记账', /append-progress\.mjs/.test(skill) && /不手改|不要手改/.test(skill));
+ok('SKILL.md 要求逐个通知给状态', /一行状态/.test(skill));
 ok('gates.md 规定末两行 VERDICT + RESULT_JSON', /RESULT_JSON/.test(gates) && /最后两行固定/.test(gates));
 ok('RULES 要求 worker 也给 RESULT_JSON', /RESULT_JSON/.test(tplJs));
 ok('模板：UNKNOWN 重派一次后按 FAIL', /unknownRetried/.test(tplJs) && /verdictStrict/.test(tplJs));

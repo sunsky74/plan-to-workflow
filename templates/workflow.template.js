@@ -338,8 +338,28 @@ function ok(r, marker) {
     return String((r && r.output) || "").indexOf(marker) >= 0;
 }
 
-function line(stage, round, verdict) {
-    return stage + " | " + verdict + " r" + round;
+// progress 行就是 progress.md 里那一行本身：4 列表格，编排方直接追加，不用再加工。
+//   时刻 | stage/段 | 结果 | 备注
+function stamp() {
+    const d = new Date();
+    const p2 = function (n) { return String(n).padStart(2, "0"); };
+    return d.getUTCFullYear() + "-" + p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) +
+        " " + p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+}
+
+function line(stage, round, verdict, note) {
+    const result = verdict === "RESUME" || verdict === "TIMEOUT"
+        ? verdict
+        : verdict + " r" + round;
+    return "| " + stamp() + " | " + stage + " | " + result + " | " + (note || "") + " |";
+}
+
+// 进度事件：沙箱里有 emit 就发，没有就静默（不能因为观测不到就抛错）
+function notify(type, stage, round, extra) {
+    if (typeof emit !== "function") return;
+    try {
+        emit(Object.assign({ type: type, stage: stage, round: round, at: stamp() }, extra || {}));
+    } catch (e) { /* 观测失败不影响主流程 */ }
 }
 
 // ════════════════ 控制流：串行层 + 人工段 + 轮次门禁 + 层内并行 ════════════════
@@ -401,6 +421,8 @@ for (let wi = 0; wi < WAVES.length; wi++) {
             };
         }
 
+        for (let i = 0; i < pending.length; i++) notify("stage-start", pending[i], round, { kind: STAGE_KIND[pending[i]] || "feature" });
+
         const implSpecs = pending.map(function (s) {
             return implSpec(s, round, "", "", timeoutMsOf(s));
         });
@@ -414,6 +436,8 @@ for (let wi = 0; wi < WAVES.length; wi++) {
             if (!r || r.ok || !isTimeout(r) || resumed[s]) continue;
             resumed[s] = true;
             report.resumes.push({ stage: s, round: round, reason: "timeout" });
+            notify("resume", s, round, { reason: "timeout" });
+            report.progress.push(line(s, round, "TIMEOUT", "超时，自动续跑一次"));
             retrySpecs.push(
                 implSpec(
                     s,
@@ -476,6 +500,7 @@ for (let wi = 0; wi < WAVES.length; wi++) {
             if (!r || r.ok || !isTimeout(r) || gateResumed[g.stage]) continue;
             gateResumed[g.stage] = true;
             report.resumes.push({ stage: g.stage, round: round, reason: "gate-timeout" });
+            notify("resume", g.stage, round, { reason: "gate-timeout" });
             gRetry.push({
                 index: i,
                 spec: {
@@ -504,6 +529,7 @@ for (let wi = 0; wi < WAVES.length; wi++) {
             if (verdictOf(r.output) !== 'UNKNOWN' || unknownRetried[g.stage]) continue;
             unknownRetried[g.stage] = true;
             report.resumes.push({ stage: g.stage, round: round, reason: "gate-unknown" });
+            notify("resume", g.stage, round, { reason: "gate-unknown" });
             uRetry.push({
                 index: i,
                 spec: {
@@ -545,6 +571,7 @@ for (let wi = 0; wi < WAVES.length; wi++) {
             if (verdictStrict(g) === 'PASS') {
                 waveRec.stages.push({ stage: s, ok: true, rounds: round });
                 report.progress.push(line(s, round, "PASS"));
+                notify("stage-end", s, round, { verdict: "PASS" });
             } else {
                 stillFailing.push(s);
             }
@@ -558,6 +585,7 @@ for (let wi = 0; wi < WAVES.length; wi++) {
         for (let i = 0; i < pending.length; i++) {
             waveRec.stages.push({ stage: pending[i], ok: false, rounds: waveRec.rounds });
             report.progress.push(line(pending[i], waveRec.rounds, "FAIL"));
+            notify("stage-end", pending[i], waveRec.rounds, { verdict: "FAIL" });
         }
         report.halted = true;
         report.reason = pending[0] + " 在 " + MAX_ROUNDS + " 轮内未过门禁：" + String(findings[pending[0]] || "").slice(-600);
