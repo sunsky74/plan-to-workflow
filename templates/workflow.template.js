@@ -88,6 +88,8 @@ const RULES = [
     "  要证明「服务能起来」，用 `run-bounded.sh 60 --until 'Started .*Application' --log app.log -- <启动命令>`；",
     "  它到点会杀掉整个进程组并按命中/超时返回 0/124 —— 不靠人看日志判断，也不留占端口的僵尸。",
     "- 输出末尾必须有一行 `STATUS: DONE` 或 `STATUS: BLOCKED <原因>`",
+    "  紧接其后是机器可读的收尾行（缺了编排脚本只能猜）：",
+    '    RESULT_JSON: {"status":"DONE"}   或   RESULT_JSON: {"status":"BLOCKED"}',
     "",
     "`STATUS: BLOCKED` 之后**必须**紧跟裁决块，缺任一项视为「决议不完整」（门禁判 P0）：",
     "  选项: A) <做法> @代价  /  B) <做法> @代价",
@@ -235,7 +237,12 @@ function revTask(stage, implOutput, round) {
         "",
         "## 本 stage 专项核对", GATES[stage], "",
         "## 实现者输出（尾部）", String(implOutput).slice(-3000), "",
-        "输出格式与末行 VERDICT 严格按 " + GATES_DOC
+        "输出格式与末行 VERDICT 严格按 " + GATES_DOC,
+        "",
+        "输出格式（末两行，缺一视为未裁决）:",
+        "VERDICT: PASS|FAIL|BLOCKED",
+        'RESULT_JSON: {"verdict":"PASS","p0":0}',
+        "不要用「结论：通过」代替 VERDICT —— 编排脚本按行首 VERDICT 判定。",
     ].join("\n");
 }
 
@@ -269,8 +276,63 @@ function lastDecl(out, key) {
     const hits = [...String(out || '').matchAll(re)];
     return hits.length ? hits[hits.length - 1][1].toUpperCase() : '';
 }
-const isBlocked = function (out) { return lastDecl(out, 'STATUS') === 'BLOCKED'; };
-const verdictOf = function (out) { return lastDecl(out, 'VERDICT'); };
+// 解析顺序固定，别改：
+//   1) 最后一条 RESULT_JSON（机器可读，优先）
+//   2) 最后一个行首 VERDICT:/STATUS:
+//   3) 行首中文「结论：通过 / 判定：不通过 / …」
+//   4) 都没有 → UNKNOWN（调用方必须把它当「没判」，不能当失败，也不能当通过）
+//
+// 为什么必须有第 3 条：真实事故里编排脚本只认英文 VERDICT: PASS，而一部分 reviewer
+// 写的是「结论：通过」→ 6 个真通过的任务被记成 blocked，出口验收因此从未执行。
+// 只认一种写法会用「失败」掩盖「通过」，比漏判更贵。
+// 顺序有意义：先排「不通过/未通过」，否则 `通过` 会把它们吃成 PASS
+const ZH_VERDICT = [[/不通过|未通过/, 'FAIL'], [/阻塞|需裁决/, 'BLOCKED'], [/通过/, 'PASS']];
+
+function jsonVerdict(out) {
+    const re = /^[\s>*`\-]*RESULT_JSON:[ \t]*(.+)$/gim;
+    const hits = [...String(out || '').matchAll(re)];
+    for (let i = hits.length - 1; i >= 0; i--) {
+        try {
+            const v = JSON.parse(hits[i][1].trim());
+            if (v && typeof v.verdict === 'string' && /^(PASS|FAIL|BLOCKED)$/i.test(v.verdict)) {
+                return v.verdict.toUpperCase();
+            }
+        } catch (e) { /* 非法 JSON 就往下走，不要整条判失败 */ }
+    }
+    return '';
+}
+
+function zhVerdict(out) {
+    // 交替顺序必须长的在前：`通过` 放前面会把「不通过」读成 PASS
+    const re = /^[\s>*`\-]*(?:结论|判定|评审结论|门禁结论)[ \t]*[:：][ \t]*(不通过|未通过|需裁决|阻塞|通过)/gim;
+    const hits = [...String(out || '').matchAll(re)];
+    if (!hits.length) return '';
+    const word = hits[hits.length - 1][1];
+    for (const [re2, v] of ZH_VERDICT) if (re2.test(word)) return v;
+    return '';
+}
+
+const isBlocked = function (out) {
+    const j = jsonVerdict(out);
+    if (j) return j === 'BLOCKED';
+    const st = lastDecl(out, 'STATUS');
+    if (st) return st === 'BLOCKED';
+    return zhVerdict(out) === 'BLOCKED';
+};
+
+// 重派后仍 UNKNOWN → 当 FAIL。UNKNOWN 绝不能当通过，也不能静默跳过。
+function verdictStrict(g) {
+    const v = verdictOf(g && g.output);
+    return v === 'UNKNOWN' ? 'FAIL' : v;
+}
+
+const verdictOf = function (out) {
+    const j = jsonVerdict(out);
+    if (j) return j;
+    const v = lastDecl(out, 'VERDICT');
+    if (v) return v;
+    return zhVerdict(out) || 'UNKNOWN';
+};
 
 function ok(r, marker) {
     return String((r && r.output) || "").indexOf(marker) >= 0;
@@ -286,6 +348,7 @@ function line(stage, round, verdict) {
 
 const resumed = {};       // 每个 stage 的实现只允许续跑一次
 const gateResumed = {};    // 每个 stage 的门禁只允许超时重派一次
+const unknownRetried = {}; // 每个 stage 的门禁只允许「格式重派」一次
 const report = { halted: false, reason: "", waves: [], progress: [], resumes: [], nextManual: "", at: "" };
 
 // 异常兜底：provider / API / 参数被拒 / 运行时错误都要留下「死在哪、哪些过了」。
@@ -431,6 +494,38 @@ for (let wi = 0; wi < WAVES.length; wi++) {
             for (let i = 0; i < gRetry.length; i++) gates[gRetry[i].index] = again[i];
         }
 
+        // 门禁返回 UNKNOWN（没按格式写裁决）→ 重派一次并明确要求末两行；
+        // 仍 UNKNOWN 就由 verdictStrict 判 FAIL。禁止把「读不出结论」当成通过。
+        const uRetry = [];
+        for (let i = 0; i < toGate.length; i++) {
+            const g = toGate[i];
+            const r = gates[i];
+            if (!r || !r.ok) continue;
+            if (verdictOf(r.output) !== 'UNKNOWN' || unknownRetried[g.stage]) continue;
+            unknownRetried[g.stage] = true;
+            report.resumes.push({ stage: g.stage, round: round, reason: "gate-unknown" });
+            uRetry.push({
+                index: i,
+                spec: {
+                    key: g.stage + "-gate-r" + round + "-fmt",
+                    agent: "reviewer",
+                    model: MODEL_GATE,
+                    label: g.stage + " 门禁 r" + round + "（格式重派）",
+                    maxRuntimeMs: GATE_TIMEOUT_MS,
+                    checkpointBeforeDeadlineMs: Math.min(CHECKPOINT_CAP_MS, Math.round(GATE_TIMEOUT_MS * 0.2)),
+                    task: revTask(g.stage, g.output, round) +
+                        "\n\n上次输出里没有可解析的裁决。务必按格式输出**末两行**：\n" +
+                        "VERDICT: PASS|FAIL|BLOCKED\n" +
+                        'RESULT_JSON: {"verdict":"PASS","p0":0}\n' +
+                        "不要用「结论：通过」代替 VERDICT。"
+                }
+            });
+        }
+        if (uRetry.length) {
+            const again = await runs.all(uRetry.map(function (x) { return x.spec; }));
+            for (let i = 0; i < uRetry.length; i++) gates[uRetry[i].index] = again[i];
+        }
+
         // —— 判定与收敛
         const stillFailing = [];
         for (let i = 0; i < toGate.length; i++) {
@@ -441,13 +536,13 @@ for (let wi = 0; wi < WAVES.length; wi++) {
                 report.reason = s + " 第 " + round + " 轮门禁运行失败";
                 break;
             }
-            if (verdictOf(g.output) === 'BLOCKED') {
+            if (verdictStrict(g) === 'BLOCKED') {
                 report.halted = true;
                 report.reason = s + " 门禁需裁决：" + String(g.output).slice(-600);
                 break;
             }
             findings[s] = g.output;
-            if (verdictOf(g.output) === 'PASS') {
+            if (verdictStrict(g) === 'PASS') {
                 waveRec.stages.push({ stage: s, ok: true, rounds: round });
                 report.progress.push(line(s, round, "PASS"));
             } else {
@@ -480,8 +575,8 @@ if (!report.halted) {
     finalGates = gs.map(function (g, i) {
         return {
             gate: i === 0 ? "A-规格符合性" : "B-对抗性",
-            ok: g.ok && verdictOf(g.output) === 'PASS',
-            blocked: verdictOf(g.output) === 'BLOCKED',
+            ok: g.ok && verdictStrict(g) === 'PASS',
+            blocked: verdictStrict(g) === 'BLOCKED',
             outputTail: String(g.output).slice(-1200)
         };
     });

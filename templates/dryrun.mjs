@@ -70,11 +70,15 @@ async function run(label, args, failStages) {
                         seenG[st] = (seenG[st] || 0) + 1;
                         if (seenG[st] === 1) return { ok: false, failureKind: 'timeout', output: '' };
                     }
+                    if (failStages && failStages[st] === 'unknown-once') {
+                        seenG[st] = (seenG[st] || 0) + 1;
+                        if (seenG[st] === 1) return { ok: true, output: '门禁通过了，但…' };
+                    }
                     if (failStages && failStages[st] === 'timeout') {
                         return { ok: false, failureKind: 'timeout', output: '' };
                     }
                     const gv = failStages && failStages[st];
-                    if (gv && gv !== 'timeout' && gv !== 'timeout-once') {
+                    if (gv && gv !== 'timeout' && gv !== 'timeout-once' && gv !== 'unknown-once') {
                         return { ok: true, output: 'VERDICT: FAIL' };
                     }
                     return { ok: true, output: 'VERDICT: PASS' };
@@ -182,6 +186,11 @@ if ((res3.resumes || []).length) bad.push('非超时失败不该续跑');
 results.push(await run('门禁超时 → 重派 → PASS', { fromStage: lastStage, manualDone: lastM }, { [lastStage]: 'timeout-once' }));
 const res4 = results[results.length - 1];
 if (res4.halted && /门禁/.test(res4.reason || '')) bad.push('门禁超时重派后仍按失败停了');
+
+results.push(await run('门禁首次 UNKNOWN → 重派 → PASS', { fromStage: lastStage, manualDone: lastM }, { [lastStage]: 'unknown-once' }));
+const res5 = results[results.length - 1];
+if (res5.halted) bad.push('门禁 UNKNOWN 重派后仍停机：' + (res5.reason || ''));
+if (!(res5.resumes || []).some((x) => x.reason === 'gate-unknown')) bad.push('UNKNOWN 没有触发格式重派');
 
 console.log('\n' + (bad.length ? '✗ 干跑发现问题:\n  - ' + bad.join('\n  - ') : '✓ 干跑通过：跳层、人工段放行、门禁收敛、BLOCKED 停机都符合预期'));
 process.exit(bad.length ? 1 : 0);

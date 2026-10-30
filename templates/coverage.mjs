@@ -19,6 +19,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const TEMPLATE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const argv = process.argv.slice(2);
 let scopeArg = null;
@@ -260,6 +264,32 @@ function checkDispatchContract(wsrc) {
         }
     }
 
+    // C11 裁决解析器必须与模板一致（解析器漂移过一次：只认英文 VERDICT，
+    // 6 个「结论：通过」被记成 blocked）。哈希对不上就说明这份 workflow 用了自己的解析器。
+    {
+        const tplPath = path.join(TEMPLATE_DIR, 'workflow.template.js');
+        const grab = (src) => {
+            const a = src.indexOf('function lastDecl(');
+            const b = src.indexOf("return zhVerdict(out) || 'UNKNOWN';");
+            if (a < 0 || b < a) return '';
+            return src.slice(a, src.indexOf('\n};', b) + 3);
+        };
+        const want = fs.existsSync(tplPath) ? grab(fs.readFileSync(tplPath, 'utf8')) : '';
+        const got = grab(wsrc);
+        if (!want) {
+            console.log('  ! 读不到模板解析器 → C11 跳过');
+        } else if (!got) {
+            console.log('  ✗ 本文件没有模板解析器块 → 裁决靠自定义逻辑');
+            problems.push('解析器块缺失 → 裁决由自定义逻辑决定，与模板不一致（历史事故：只认英文 VERDICT，6 个「结论：通过」被记成 blocked）');
+        } else if (got !== want) {
+            const h = (x) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 12);
+            console.log(`  ✗ 解析器与模板不一致（本文件 ${h(got)} / 模板 ${h(want)}）`);
+            problems.push('解析器与模板哈希不一致 → 裁决语义可能已经漂移，请改用模板的 lastDecl/verdictOf');
+        } else {
+            console.log('  ✓ 解析器与模板一致');
+        }
+    }
+
     // C8 每个派发点的选项对象必须带超时
     const MAX_TIMEOUT_MS = 25 * 60 * 1000;
     const dispatch = [];
@@ -314,13 +344,21 @@ function checkDispatchContract(wsrc) {
 // 手写变体（const TASK / 模板字符串 / 对象而非数组）解析不到 stageBlocks，
 // 那时若继续跑覆盖逻辑，会报「N 个单元无人认领」这种**假结论**——比没有结论更危险。
 const shapeOk = wavesBlock && Object.keys(stageBlocks).length > 0;
-if (!shapeOk && dcProblems.length) {
+if (!shapeOk) {
+    // PARTIAL：形状不认识，覆盖矩阵不判；但派发契约/解析器这些与形状无关的结论照报。
+    // 退回 exit 2 而不是 1 —— 这**不是**「全部合格」，是「只判了一部分」。
     console.error('');
-    console.error('✗ 派发契约不达标（与文件形状无关，确定的事实）：');
-    for (const p of dcProblems) console.error('  - ' + p);
+    console.error('◐ PARTIAL：只判了与文件形状无关的部分，覆盖矩阵未判。');
+    if (dcProblems.length) {
+        console.error('');
+        console.error('  确定问题 ' + dcProblems.length + ' 条：');
+        for (const p of dcProblems) console.error('  - ' + p);
+    } else {
+        console.error('  形状无关检查全部通过（但这不能证明覆盖闭合）。');
+    }
     console.error('');
-    console.error('  （覆盖矩阵未判：本文件不是模板形状，需人工核）');
-    process.exit(1);
+    console.error('  → 按 SKILL.md：PARTIAL 不得据此派发，除非用户明确豁免。');
+    process.exit(2);
 }
 if (!shapeOk) {
     console.error('✗ 无法解析此文件的结构，不做覆盖判断，也不出结论。');

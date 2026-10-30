@@ -101,7 +101,13 @@ function fixture(name, opt = {}) {
     ]
         .filter(Boolean)
         .join('\n');
-    fs.writeFileSync(path.join(dir, 'wf.js'), js);
+    // 真实产物是「模板 + 填内容」，所以一定带模板解析器块；fixture 也带上，
+    // 否则 C11 会把每个 fixture 都当成「自定义解析器」。
+    const tplSrc = fs.readFileSync(path.join(HERE, 'workflow.template.js'), 'utf8');
+    const pa = tplSrc.indexOf('function lastDecl(');
+    const pb = tplSrc.indexOf("return zhVerdict(out) || 'UNKNOWN';");
+    const parser = pa >= 0 && pb > pa ? tplSrc.slice(pa, tplSrc.indexOf('\n};', pb) + 3) : '';
+    fs.writeFileSync(path.join(dir, 'wf.js'), js + '\n' + parser + '\n');
     fs.writeFileSync(path.join(dir, 'tasks.md'), opt.tasks || '- [ ] 1.1 造个东西\n');
     if (opt.profile) fs.writeFileSync(path.join(dir, 'profile.md'), opt.profile);
     return dir;
@@ -288,6 +294,51 @@ const runTpl = async (args, implOut) => {
     ok('progress.md 结果列不合规被拦住', /格式不符/.test(r2.out) && r2.code === 1);
 }
 
+// ── T17 verdict 解析：直接从模板里抠出解析器本体来测（不是复写一份）
+{
+    const src = fs.readFileSync(path.join(SKILL, 'templates', 'workflow.template.js'), 'utf8');
+    const a = src.indexOf('function lastDecl(');
+    const b = src.indexOf("return zhVerdict(out) || 'UNKNOWN';");
+    ok('能定位模板里的解析器块', a > 0 && b > a);
+    let P = null;
+    if (a > 0 && b > a) {
+        const end = src.indexOf('\n};', b) + 3;
+        const block = src.slice(a, end);
+        P = new Function(block + '\nreturn { verdictOf, isBlocked, lastDecl };')();
+    }
+    if (P) {
+        const cases = [
+            ['VERDICT: PASS', 'PASS', '英文 VERDICT'],
+            ['- 结论：通过', 'PASS', '行首中文（真实事故形态）'],
+            ['判定：不通过', 'FAIL', '行首中文 FAIL'],
+            ['门禁结论：需裁决', 'BLOCKED', '行首中文 BLOCKED'],
+            ['门禁通过了，但…', 'UNKNOWN', '中文不在行首 → 不认（避免句中误判）'],
+            ['VERDICT: PASS\nRESULT_JSON: {"verdict":"FAIL"}', 'FAIL', 'RESULT_JSON 优先于 VERDICT'],
+            ['VERDICT: PASS\nRESULT_JSON: {坏 JSON}', 'PASS', '非法 JSON 回退到 VERDICT'],
+            ['没人写裁决', 'UNKNOWN', '什么都没有 → UNKNOWN'],
+            ['VERDICT: PASS\n\n若无法判断则写 VERDICT: FAIL\n\n谢谢', 'PASS', '行首最后一条生效'],
+            ['STATUS: DONE\n正文曾引用 STATUS: BLOCKED', '', '引用不能盖过末行']
+        ];
+        for (const [out, want, label] of cases) {
+            const got = label.startsWith('引用') ? (P.isBlocked(out) ? 'BLOCKED' : '') : P.verdictOf(out);
+            ok(`verdict 解析：${label}`, got === want, `got=${got} want=${want}`);
+        }
+        // 真实 fixture：reviewer 写「结论：通过」
+        const inc = path.join(SKILL, 'fixtures', 'incidents', '2026-10-29-alert-center');
+        const f1 = path.join(inc, 'verdict-zh.txt');
+        if (fs.existsSync(f1)) {
+            ok('真实件 verdict-zh.txt 判为 PASS', P.verdictOf(fs.readFileSync(f1, 'utf8')) === 'PASS');
+        }
+        const f2 = path.join(inc, 'verdict-quote.txt');
+        if (fs.existsSync(f2)) {
+            const t = fs.readFileSync(f2, 'utf8');
+            ok('真实件 verdict-quote.txt：正文引用 BLOCKED 不算本次结论',
+                P.isBlocked(t) === false && P.lastDecl(t, 'STATUS') === 'DONE',
+                `isBlocked=${P.isBlocked(t)} lastDecl=${P.lastDecl(t, 'STATUS')}`);
+        }
+    }
+}
+
 // ── T18 有界执行器：run-bounded.sh
 {
     const BIN = path.join(HERE, 'bin', 'run-bounded.sh');
@@ -405,8 +456,11 @@ const runTpl = async (args, implOut) => {
         'const SPEC = [{ key: "a", agent: "worker", task: "t" }];\n'
     );
     const r = cov(d, false);
-    ok('手写变体也查派发超时（不被形状闸门吞掉）', r.code === 1 && /缺 maxRuntimeMs/.test(r.out),
+    // 手写变体走 PARTIAL（exit 2）：形状无关的问题照报，但覆盖矩阵不判
+    ok('手写变体走 PARTIAL 且照报派发超时',
+        r.code === 2 && /PARTIAL/.test(r.out) && /缺 maxRuntimeMs/.test(r.out),
         `code=${r.code} ` + r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+    ok('手写变体缺解析器被判 C11', /解析器块缺失/.test(r.out));
 }
 
 // T20 C10：STAGE_KIND 取值与登记
@@ -496,6 +550,11 @@ ok('模板 revTask 传轮次', /revTask\(g\.stage, g\.output, round\)/.test(tplJ
 ok('模板 revTask 传授权范围', /STAGES\[stage\]/.test(tplJs));
 ok('模板有异常兜底（try/catch + failure）', /catch \(e\)/.test(tplJs) && /failure: failure/.test(tplJs));
 ok('模板 return 带幂等提醒', /不幂等/.test(tplJs));
+ok('gates.md 规定末两行 VERDICT + RESULT_JSON', /RESULT_JSON/.test(gates) && /最后两行固定/.test(gates));
+ok('RULES 要求 worker 也给 RESULT_JSON', /RESULT_JSON/.test(tplJs));
+ok('模板：UNKNOWN 重派一次后按 FAIL', /unknownRetried/.test(tplJs) && /verdictStrict/.test(tplJs));
+ok('coverage 有 C11 解析器哈希比对', /C11/.test(fs.readFileSync(path.join(HERE, 'coverage.mjs'), 'utf8')));
+ok('SKILL.md 说明 PARTIAL 不得派发', /PARTIAL 不得据此派发/.test(skill));
 ok('模板按档位取超时（STAGE_TIMEOUT_TIER + STAGE_KIND）', /STAGE_TIMEOUT_TIER/.test(tplJs) && /timeoutMsOf\(s\)/.test(tplJs) && /GATE_TIMEOUT_MS/.test(tplJs));
 ok('模板超时后自动续跑一次', /resumed\[s\]/.test(tplJs) && /-resume/.test(tplJs));
 ok('模板门禁超时重派一次', /gateResumed\[g\.stage\]/.test(tplJs));
