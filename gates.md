@@ -98,10 +98,13 @@ P1 [证据] — 一句话结论
 P2 — 一句话结论（→ 建议登记到 <本项目的债/待办位置>）
 ```
 
-最后一行只能是三者之一：
+最后两行固定（顺序不能反，缺一视为未裁决）：
 
 ```
 VERDICT: PASS
-VERDICT: FAIL
-VERDICT: BLOCKED
+RESULT_JSON: {"verdict":"PASS","p0":0}
 ```
+
+`VERDICT` 取 `PASS` / `FAIL` / `BLOCKED` 三者之一。`RESULT_JSON` 是同一结论的机器可读副本，`p0` 写本轮 P0 条数。
+
+**不要**用「结论：通过」「判定：不通过」代替 `VERDICT`。解析器认中文只为兜住历史输出，它不是合法写法 —— 编排脚本按行首 `VERDICT` 判定，漂移了就会把「通过」读成「未裁决」。

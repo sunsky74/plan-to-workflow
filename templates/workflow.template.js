@@ -32,10 +32,38 @@ const MODEL_GATE = "<provider/model-gate-id>"; // 必须与 worker 不同族或�
 const STAGE_MODEL = {};
 const MAX_ROUNDS = 2;
 
+// 执行模式。lite 只对「单仓、少量文件、无 DDL/生产配置」的小改动开放，
+// 换来的是：只跑总门禁 A、冷审 1 轮、判定卡与编排表一次确认。
+// 越界会被 coverage 的 C12 拦下 —— 省掉的那部分检查是有代价的，不能随手省。
+const MODE = "standard"; // "standard" | "lite" 
+
 // 每次派发的时间上限。**必须有**：没有它，一个卡住的 worker 只会被人工发现，实测代价 49 分钟／次。
 // checkpointBeforeDeadlineMs 让子 agent 在到点前结账并汇报，于是「卡住」变成「超时 + 有部分结论」。
-const STAGE_TIMEOUT_MS = 25 * 60 * 1000;
-const STAGE_CHECKPOINT_MS = 3 * 60 * 1000;
+//
+// 按类型分档：同样的 25 分钟给「改一个枚举」是浪费，给「跨 6 个模块接线」又不够。
+// STAGE_KIND 缺省 feature；coverage 的 C10 会校验取值合法。
+const STAGE_TIMEOUT_TIER = { skeleton: 10, mechanical: 15, feature: 25, verify: 12 }; // 单位：分钟
+const STAGE_KIND = {};
+const GATE_TIMEOUT_MS = 8 * 60 * 1000;
+const CHECKPOINT_CAP_MS = 3 * 60 * 1000;
+const RESUME_RATIO = 0.6;
+
+function timeoutMsOf(stage) {
+    const min = STAGE_TIMEOUT_TIER[STAGE_KIND[stage] || "feature"] || STAGE_TIMEOUT_TIER.feature;
+    const ms = min * 60 * 1000;
+    return { ms: ms, checkpoint: Math.min(CHECKPOINT_CAP_MS, Math.round(ms * 0.2)), resumeMs: Math.round(ms * RESUME_RATIO) };
+}
+
+// 超时判定：结构化字段优先；pi 目前不保证给，退到错误文本；两者都没有就按「非超时」处理
+// （宁可当普通失败停机，也不要把普通失败当成超时反复重试）。
+function isTimeout(r) {
+    if (!r) return false;
+    const kind = r.failureKind || r.failure_kind || (r.error && (r.error.kind || r.error.failureKind));
+    if (typeof kind === "string") return kind === "timeout";
+    const txt = String(r.failure || r.error || "");
+    if (!txt) return false;
+    return /timed?\s*out|timeout|超时/i.test(txt);
+}
 
 // ════════════════ 必读（必须按本项目重写） ════════════════
 const DOCS = [
@@ -62,8 +90,11 @@ const RULES = [
     "- 同一条验证命令最多跑 2 次（含换参数）。第 2 次仍 FAIL → 立刻 `STATUS: BLOCKED`，",
     "  写清「验证器疑似有 bug」和「已用什么样本自证」。不许为了让它变绿而改交付物。",
     "- 禁止前台常驻命令（不会自己退出）：mvn spring-boot:run / npm start / tail -f / nc -l / 起服务端。",
-    "  需要起服务时用 `timeout 60s <cmd>`，或后台 + 显式 kill + 轮询日志到关键字为止。",
+    "  要证明「服务能起来」，用 `run-bounded.sh 60 --until 'Started .*Application' --log app.log -- <启动命令>`；",
+    "  它到点会杀掉整个进程组并按命中/超时返回 0/124 —— 不靠人看日志判断，也不留占端口的僵尸。",
     "- 输出末尾必须有一行 `STATUS: DONE` 或 `STATUS: BLOCKED <原因>`",
+    "  紧接其后是机器可读的收尾行（缺了编排脚本只能猜）：",
+    '    RESULT_JSON: {"status":"DONE"}   或   RESULT_JSON: {"status":"BLOCKED"}',
     "",
     "`STATUS: BLOCKED` 之后**必须**紧跟裁决块，缺任一项视为「决议不完整」（门禁判 P0）：",
     "  选项: A) <做法> @代价  /  B) <做法> @代价",
@@ -211,7 +242,12 @@ function revTask(stage, implOutput, round) {
         "",
         "## 本 stage 专项核对", GATES[stage], "",
         "## 实现者输出（尾部）", String(implOutput).slice(-3000), "",
-        "输出格式与末行 VERDICT 严格按 " + GATES_DOC
+        "输出格式与末行 VERDICT 严格按 " + GATES_DOC,
+        "",
+        "输出格式（末两行，缺一视为未裁决）:",
+        "VERDICT: PASS|FAIL|BLOCKED",
+        'RESULT_JSON: {"verdict":"PASS","p0":0}',
+        "不要用「结论：通过」代替 VERDICT —— 编排脚本按行首 VERDICT 判定。",
     ].join("\n");
 }
 
@@ -245,22 +281,100 @@ function lastDecl(out, key) {
     const hits = [...String(out || '').matchAll(re)];
     return hits.length ? hits[hits.length - 1][1].toUpperCase() : '';
 }
-const isBlocked = function (out) { return lastDecl(out, 'STATUS') === 'BLOCKED'; };
-const verdictOf = function (out) { return lastDecl(out, 'VERDICT'); };
+// 解析顺序固定，别改：
+//   1) 最后一条 RESULT_JSON（机器可读，优先）
+//   2) 最后一个行首 VERDICT:/STATUS:
+//   3) 行首中文「结论：通过 / 判定：不通过 / …」
+//   4) 都没有 → UNKNOWN（调用方必须把它当「没判」，不能当失败，也不能当通过）
+//
+// 为什么必须有第 3 条：真实事故里编排脚本只认英文 VERDICT: PASS，而一部分 reviewer
+// 写的是「结论：通过」→ 6 个真通过的任务被记成 blocked，出口验收因此从未执行。
+// 只认一种写法会用「失败」掩盖「通过」，比漏判更贵。
+// 顺序有意义：先排「不通过/未通过」，否则 `通过` 会把它们吃成 PASS
+const ZH_VERDICT = [[/不通过|未通过/, 'FAIL'], [/阻塞|需裁决/, 'BLOCKED'], [/通过/, 'PASS']];
+
+function jsonVerdict(out) {
+    const re = /^[\s>*`\-]*RESULT_JSON:[ \t]*(.+)$/gim;
+    const hits = [...String(out || '').matchAll(re)];
+    for (let i = hits.length - 1; i >= 0; i--) {
+        try {
+            const v = JSON.parse(hits[i][1].trim());
+            if (v && typeof v.verdict === 'string' && /^(PASS|FAIL|BLOCKED)$/i.test(v.verdict)) {
+                return v.verdict.toUpperCase();
+            }
+        } catch (e) { /* 非法 JSON 就往下走，不要整条判失败 */ }
+    }
+    return '';
+}
+
+function zhVerdict(out) {
+    // 交替顺序必须长的在前：`通过` 放前面会把「不通过」读成 PASS
+    const re = /^[\s>*`\-]*(?:结论|判定|评审结论|门禁结论)[ \t]*[:：][ \t]*(不通过|未通过|需裁决|阻塞|通过)/gim;
+    const hits = [...String(out || '').matchAll(re)];
+    if (!hits.length) return '';
+    const word = hits[hits.length - 1][1];
+    for (const [re2, v] of ZH_VERDICT) if (re2.test(word)) return v;
+    return '';
+}
+
+const isBlocked = function (out) {
+    const j = jsonVerdict(out);
+    if (j) return j === 'BLOCKED';
+    const st = lastDecl(out, 'STATUS');
+    if (st) return st === 'BLOCKED';
+    return zhVerdict(out) === 'BLOCKED';
+};
+
+// 重派后仍 UNKNOWN → 当 FAIL。UNKNOWN 绝不能当通过，也不能静默跳过。
+function verdictStrict(g) {
+    const v = verdictOf(g && g.output);
+    return v === 'UNKNOWN' ? 'FAIL' : v;
+}
+
+const verdictOf = function (out) {
+    const j = jsonVerdict(out);
+    if (j) return j;
+    const v = lastDecl(out, 'VERDICT');
+    if (v) return v;
+    return zhVerdict(out) || 'UNKNOWN';
+};
 
 function ok(r, marker) {
     return String((r && r.output) || "").indexOf(marker) >= 0;
 }
 
-function line(stage, round, verdict) {
-    return stage + " | " + verdict + " r" + round;
+// progress 行就是 progress.md 里那一行本身：4 列表格，编排方直接追加，不用再加工。
+//   时刻 | stage/段 | 结果 | 备注
+function stamp() {
+    const d = new Date();
+    const p2 = function (n) { return String(n).padStart(2, "0"); };
+    return d.getUTCFullYear() + "-" + p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) +
+        " " + p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes());
+}
+
+function line(stage, round, verdict, note) {
+    const result = verdict === "RESUME" || verdict === "TIMEOUT"
+        ? verdict
+        : verdict + " r" + round;
+    return "| " + stamp() + " | " + stage + " | " + result + " | " + (note || "") + " |";
+}
+
+// 进度事件：沙箱里有 emit 就发，没有就静默（不能因为观测不到就抛错）
+function notify(type, stage, round, extra) {
+    if (typeof emit !== "function") return;
+    try {
+        emit(Object.assign({ type: type, stage: stage, round: round, at: stamp() }, extra || {}));
+    } catch (e) { /* 观测失败不影响主流程 */ }
 }
 
 // ════════════════ 控制流：串行层 + 人工段 + 轮次门禁 + 层内并行 ════════════════
 // 关键：轮次循环在外层，stage 并行在内层。这样既能并行，又只需顶层 await
 // （workflow 沙箱不支持嵌套 async 函数，per-stage 的 async 重试循环会被拒）。
 
-const report = { halted: false, reason: "", waves: [], progress: [], nextManual: "", at: "" };
+const resumed = {};       // 每个 stage 的实现只允许续跑一次
+const gateResumed = {};    // 每个 stage 的门禁只允许超时重派一次
+const unknownRetried = {}; // 每个 stage 的门禁只允许「格式重派」一次
+const report = { halted: false, mode: MODE, reason: "", waves: [], progress: [], resumes: [], nextManual: "", at: "" };
 
 // 异常兜底：provider / API / 参数被拒 / 运行时错误都要留下「死在哪、哪些过了」。
 // 没有这层，脚本一抛错连 return 都到不了，report.progress 全丢（failureKind 会记成 script）。
@@ -300,18 +414,55 @@ for (let wi = 0; wi < WAVES.length; wi++) {
         waveRec.rounds = round;
 
         // —— 并行派发本轮所有 pending stage
-        const implSpecs = pending.map(function (s) {
+        function implSpec(s, round, tail, suffix, budget) {
             return {
-                key: s + "-impl-r" + round,
+                key: s + "-impl-r" + round + (suffix || ""),
                 agent: "worker",
                 model: STAGE_MODEL[s] || MODEL_WORKER,
-                label: s + " 实现 r" + round,
-                maxRuntimeMs: STAGE_TIMEOUT_MS,
-                checkpointBeforeDeadlineMs: STAGE_CHECKPOINT_MS,
-                task: implTask(s, round, findings[s] || "")
+                label: s + " 实现 r" + round + (suffix || ""),
+                maxRuntimeMs: budget.ms,
+                checkpointBeforeDeadlineMs: budget.checkpoint,
+                task: (tail || "") + implTask(s, round, findings[s] || "")
             };
+        }
+
+        for (let i = 0; i < pending.length; i++) notify("stage-start", pending[i], round, { kind: STAGE_KIND[pending[i]] || "feature" });
+
+        const implSpecs = pending.map(function (s) {
+            return implSpec(s, round, "", "", timeoutMsOf(s));
         });
-        const impls = await runs.all(implSpecs);
+        let impls = await runs.all(implSpecs);
+
+        // —— 超时自动续跑一次：超时通常只是量大，不是做错了；非超时失败直接停机，不重试
+        const retrySpecs = [];
+        for (let i = 0; i < pending.length; i++) {
+            const s = pending[i];
+            const r = impls[i];
+            if (!r || r.ok || !isTimeout(r) || resumed[s]) continue;
+            resumed[s] = true;
+            report.resumes.push({ stage: s, round: round, reason: "timeout" });
+            notify("resume", s, round, { reason: "timeout" });
+            report.progress.push(line(s, round, "TIMEOUT", "超时，自动续跑一次"));
+            retrySpecs.push(
+                implSpec(
+                    s,
+                    round,
+                    "上次执行超时被终止。先只读核对现状、跑一次有界自检，只补缺口；禁止整体重写；禁止前台常驻命令。\n\n",
+                    "-resume",
+                    { ms: timeoutMsOf(s).resumeMs, checkpoint: Math.min(CHECKPOINT_CAP_MS, Math.round(timeoutMsOf(s).resumeMs * 0.2)) }
+                )
+            );
+        }
+        if (retrySpecs.length) {
+            const again = await runs.all(retrySpecs);
+            const byStage = {};
+            for (let i = 0; i < retrySpecs.length; i++) {
+                byStage[retrySpecs[i].key.split("-impl-")[0]] = again[i];
+            }
+            impls = pending.map(function (s, i) {
+                return byStage[s] || impls[i];
+            });
+        }
 
         // —— 分清谁 BLOCKED / 谁跑挂了 / 谁能进 gate
         const toGate = [];
@@ -339,12 +490,72 @@ for (let wi = 0; wi < WAVES.length; wi++) {
                 agent: "reviewer",
                 model: MODEL_GATE,
                 label: g.stage + " 门禁 r" + round,
-                maxRuntimeMs: STAGE_TIMEOUT_MS,
-                checkpointBeforeDeadlineMs: STAGE_CHECKPOINT_MS,
+                maxRuntimeMs: GATE_TIMEOUT_MS,
+                checkpointBeforeDeadlineMs: Math.min(CHECKPOINT_CAP_MS, Math.round(GATE_TIMEOUT_MS * 0.2)),
                 task: revTask(g.stage, g.output, round)
             };
         });
-        const gates = await runs.all(gateSpecs);
+        let gates = await runs.all(gateSpecs);
+
+        // 门禁超时不是判据问题，是没跑完 —— 重派一次；仍超时才算失败。
+        const gRetry = [];
+        for (let i = 0; i < toGate.length; i++) {
+            const r = gates[i];
+            const g = toGate[i];
+            if (!r || r.ok || !isTimeout(r) || gateResumed[g.stage]) continue;
+            gateResumed[g.stage] = true;
+            report.resumes.push({ stage: g.stage, round: round, reason: "gate-timeout" });
+            notify("resume", g.stage, round, { reason: "gate-timeout" });
+            gRetry.push({
+                index: i,
+                spec: {
+                    key: g.stage + "-gate-r" + round + "-retry",
+                    agent: "reviewer",
+                    model: MODEL_GATE,
+                    label: g.stage + " 门禁 r" + round + "（超时重派）",
+                    maxRuntimeMs: GATE_TIMEOUT_MS,
+                    checkpointBeforeDeadlineMs: Math.min(CHECKPOINT_CAP_MS, Math.round(GATE_TIMEOUT_MS * 0.2)),
+                    task: revTask(g.stage, g.output, round)
+                }
+            });
+        }
+        if (gRetry.length) {
+            const again = await runs.all(gRetry.map(function (x) { return x.spec; }));
+            for (let i = 0; i < gRetry.length; i++) gates[gRetry[i].index] = again[i];
+        }
+
+        // 门禁返回 UNKNOWN（没按格式写裁决）→ 重派一次并明确要求末两行；
+        // 仍 UNKNOWN 就由 verdictStrict 判 FAIL。禁止把「读不出结论」当成通过。
+        const uRetry = [];
+        for (let i = 0; i < toGate.length; i++) {
+            const g = toGate[i];
+            const r = gates[i];
+            if (!r || !r.ok) continue;
+            if (verdictOf(r.output) !== 'UNKNOWN' || unknownRetried[g.stage]) continue;
+            unknownRetried[g.stage] = true;
+            report.resumes.push({ stage: g.stage, round: round, reason: "gate-unknown" });
+            notify("resume", g.stage, round, { reason: "gate-unknown" });
+            uRetry.push({
+                index: i,
+                spec: {
+                    key: g.stage + "-gate-r" + round + "-fmt",
+                    agent: "reviewer",
+                    model: MODEL_GATE,
+                    label: g.stage + " 门禁 r" + round + "（格式重派）",
+                    maxRuntimeMs: GATE_TIMEOUT_MS,
+                    checkpointBeforeDeadlineMs: Math.min(CHECKPOINT_CAP_MS, Math.round(GATE_TIMEOUT_MS * 0.2)),
+                    task: revTask(g.stage, g.output, round) +
+                        "\n\n上次输出里没有可解析的裁决。务必按格式输出**末两行**：\n" +
+                        "VERDICT: PASS|FAIL|BLOCKED\n" +
+                        'RESULT_JSON: {"verdict":"PASS","p0":0}\n' +
+                        "不要用「结论：通过」代替 VERDICT。"
+                }
+            });
+        }
+        if (uRetry.length) {
+            const again = await runs.all(uRetry.map(function (x) { return x.spec; }));
+            for (let i = 0; i < uRetry.length; i++) gates[uRetry[i].index] = again[i];
+        }
 
         // —— 判定与收敛
         const stillFailing = [];
@@ -356,15 +567,16 @@ for (let wi = 0; wi < WAVES.length; wi++) {
                 report.reason = s + " 第 " + round + " 轮门禁运行失败";
                 break;
             }
-            if (verdictOf(g.output) === 'BLOCKED') {
+            if (verdictStrict(g) === 'BLOCKED') {
                 report.halted = true;
                 report.reason = s + " 门禁需裁决：" + String(g.output).slice(-600);
                 break;
             }
             findings[s] = g.output;
-            if (verdictOf(g.output) === 'PASS') {
+            if (verdictStrict(g) === 'PASS') {
                 waveRec.stages.push({ stage: s, ok: true, rounds: round });
                 report.progress.push(line(s, round, "PASS"));
+                notify("stage-end", s, round, { verdict: "PASS" });
             } else {
                 stillFailing.push(s);
             }
@@ -378,6 +590,7 @@ for (let wi = 0; wi < WAVES.length; wi++) {
         for (let i = 0; i < pending.length; i++) {
             waveRec.stages.push({ stage: pending[i], ok: false, rounds: waveRec.rounds });
             report.progress.push(line(pending[i], waveRec.rounds, "FAIL"));
+            notify("stage-end", pending[i], waveRec.rounds, { verdict: "FAIL" });
         }
         report.halted = true;
         report.reason = pending[0] + " 在 " + MAX_ROUNDS + " 轮内未过门禁：" + String(findings[pending[0]] || "").slice(-600);
@@ -388,15 +601,18 @@ for (let wi = 0; wi < WAVES.length; wi++) {
 
 // ════════════════ 双总门禁（只有整条跑完才做） ════════════════
 if (!report.halted) {
-    const gs = await runs.all([
-        { key: "final-a", agent: "reviewer", model: MODEL_GATE, label: "总门禁A 规格符合性", maxRuntimeMs: STAGE_TIMEOUT_MS, task: finalGateTask("A-规格符合性") },
-        { key: "final-b", agent: "reviewer", model: MODEL_GATE, label: "总门禁B 对抗性", maxRuntimeMs: STAGE_TIMEOUT_MS, task: finalGateTask("B-对抗性") }
-    ]);
+    const gspecs = [
+        { key: "final-a", agent: "reviewer", model: MODEL_GATE, label: "总门禁A 规格符合性", maxRuntimeMs: GATE_TIMEOUT_MS, task: finalGateTask("A-规格符合性") },
+        { key: "final-b", agent: "reviewer", model: MODEL_GATE, label: "总门禁B 对抗性", maxRuntimeMs: GATE_TIMEOUT_MS, task: finalGateTask("B-对抗性") }
+    ];
+    // lite 只跑总门禁 A：对抗性那关的产出主要用于大改动的边界找漏，
+    // 小改动上它的收益抵不过一次完整派发。
+    const gs = await runs.all(MODE === "lite" ? gspecs.slice(0, 1) : gspecs);
     finalGates = gs.map(function (g, i) {
         return {
             gate: i === 0 ? "A-规格符合性" : "B-对抗性",
-            ok: g.ok && verdictOf(g.output) === 'PASS',
-            blocked: verdictOf(g.output) === 'BLOCKED',
+            ok: g.ok && verdictStrict(g) === 'PASS',
+            blocked: verdictStrict(g) === 'BLOCKED',
             outputTail: String(g.output).slice(-1200)
         };
     });
@@ -422,7 +638,9 @@ return {
     manualText: report.nextManual ? MANUAL[report.nextManual] : "",
     waves: report.waves,
     finalGates: finalGates,
-    progress: report.progress, // 编排方逐行追加进 <change>/progress.md，并自己补时间戳
+    mode: report.mode,
+    progress: report.progress,
+    resumes: report.resumes, // 编排方逐行追加进 <change>/progress.md，并自己补时间戳
     // ⚠️ 续跑粒度是「层」不是 stage：同层已 PASS 的 stage 会被重跑，而写操作通常不幂等。
     //    重跑前查 progress 里该层有没有已 PASS 的；有就收窄 WAVES 再派发（见 SKILL.md Step 5 第 5 节）。
     manual: MANUAL             // 全部人工段，供编排方一次看全

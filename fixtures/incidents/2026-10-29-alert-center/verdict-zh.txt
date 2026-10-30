@@ -1,0 +1,11 @@
+## 评审
+
+- 正确：r1 的代码改动完好且最小化 — `decodeFaultCodes` 提取逻辑将四份重复的 N1~N4 循环合并为一个私有方法，并在读取任何列表字节前设置了哨兵防护 (AlarmDataCodec.java:97-118，通过 watchdog_diff 与 HEAD 对比验证)。根本原因分析在机制上是合理的：`readByteAsInt()` 是无符号的 (EnhancedByteB
+- 已修复：不适用 — 评审轮次，未进行任何修改。
+- 发现：无阻塞问题。两条仅作报告的 P2 备注：(a) 超出范围的既有 `<=253` 字面量仍存在于 V2025 路径中 (AlarmV2025Codec.java:73/84/95/106/117/163) — 已被实现者在 §5.2 中自报，根据任务范围 (仅限 V2016 AlarmDataCodec) 正确地未作改动；(b) `METRIC_ALERT_CODEC_FAULT_COUN
+- 结论：通过
+-----
+对照实际文件状态，所有三项验收判据均已独立验证。确认第 217 行的 `unallocated-row` 重写内容存在于 `working-tree` 差异中（0.4 的唯一代码块），并且表格中仅有一行授权数据。
+
+判定：通过
+发现：无

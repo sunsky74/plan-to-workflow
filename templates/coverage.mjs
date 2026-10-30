@@ -19,6 +19,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const TEMPLATE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const argv = process.argv.slice(2);
 let scopeArg = null;
@@ -148,6 +152,51 @@ const dcProblems = problems.splice(dcBefore);
 // ── C7 / C8 · 派发契约（防止「子 agent 自己转圈」把整轮拖住）
 // 实测：一次卡在自写验证脚本的假 FAIL 上 49 分钟，一次卡在不返回的 spring-boot:run 上 51 分钟。
 // 两条都可预防：规则写进 worker 会读的 RULES，超时写进每次派发。
+// C9 常驻命令：stage 自检里不许出现「起服务并等它」这类不会返回的动作。
+// 实测事故：s3 自检写「以 test profile 启动 service 上下文」，worker 用了
+// `mvn spring-boot:run`，命令本身成功了却永不退出 → bash 卡死 51 分钟。
+
+
+function checkDwell(wsrc) {
+    const DWELL = [
+        ['spring-boot:run', /spring-boot:run/],
+        ['java -jar（前台起服务）', /java\s+-jar\s/],
+        ['npm start / npm run dev', /npm\s+(?:start|run\s+dev)\b/],
+        ['tail -f', /tail\s+-[fF]\b/],
+        ['nc -l', /\bnc\s+-l\b/],
+        ['docker run / compose up（前台）', /docker\s+(?:run\b|compose\s+up\b)/],
+        ['启动服务/上下文/应用', /(?:启动|起)[^。；\n]{0,6}(?:服务|service|上下文|应用)/i]
+    ];
+    // 扫 RULES / STAGES / GATES / DOCS 里给 worker 和 gate 看的字符串
+    const zones = [];
+    for (const m of wsrc.matchAll(/(?:const|let)\s+(RULES|STAGES|GATES|DOCS)\s*=\s*([\s\S]*?)\n(?:const|let|function|\/\/|$)/g)) {
+        zones.push({ name: m[1], body: m[2] });
+    }
+    if (!zones.length) {
+        console.log('  ! 未识别到 RULES/STAGES/GATES/DOCS → C9 无法验证');
+        warnings.push('未识别到约束块 → 无法确认 stage 自检里没有常驻命令；请人工核对');
+        return [];
+    }
+
+    const hits = [];
+    for (const z of zones) {
+        // 逐行看，行号才定位得准
+        const lines = z.body.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            // 放行：显式说明用有界执行器
+            if (/run-bounded\.sh/.test(line)) continue;
+            for (const [label, re] of DWELL) {
+                if (re.test(line)) {
+                    hits.push(`${z.name} 第 ${i + 1} 行：${label}`);
+                    break;
+                }
+            }
+        }
+    }
+    return hits;
+}
+
 function checkDispatchContract(wsrc) {
     console.log('\n── 派发契约 ──');
 
@@ -177,7 +226,121 @@ function checkDispatchContract(wsrc) {
         }
     }
 
+    // C9 常驻命令
+    const dwell = checkDwell(wsrc);
+    if (dwell.length) {
+        console.log(`  ✗ ${dwell.length} 处常驻命令（不会自己返回）：`);
+        for (const d of dwell) console.log('      ' + d);
+        problems.push(
+            `${dwell.length} 处 stage 指令要求起常驻进程（${dwell[0]}）→ worker 会卡在等 bash 返回上。改用 run-bounded.sh --until，或改成读日志`
+        );
+    } else {
+        console.log('  ✓ 未发现常驻命令');
+    }
+
+    // C10 STAGE_KIND 必须取合法值，且每个 stage 都登记（缺省 feature，缺了就警告）
+    {
+        const tierBlk = (wsrc.match(/const\s+STAGE_TIMEOUT_TIER\s*=\s*\{([\s\S]*?)\};/) || [])[1] || '';
+        const kindBlk = (wsrc.match(/const\s+STAGE_KIND\s*=\s*\{([\s\S]*?)\};/) || [])[1];
+        const stagesBlk = (wsrc.match(/const\s+STAGES\s*=\s*\{([\s\S]*?)\n\};/) || [])[1] || '';
+        if (!tierBlk) {
+            console.log('  ! 未找到 STAGE_TIMEOUT_TIER → C10 跳过');
+        } else {
+            const kinds = [...tierBlk.matchAll(/(\w+)\s*:\s*\d+/g)].map((m) => m[1]);
+            const declared = kindBlk === undefined ? null : [...kindBlk.matchAll(/["']?([\w-]+)["']?\s*:\s*["']([\w-]+)["']/g)];
+            const bad = (declared || []).filter((m) => !kinds.includes(m[2]));
+            if (bad.length) {
+                console.log(`  ✗ STAGE_KIND 取值非法: ${bad.map((m) => m[1] + '=' + m[2]).join(', ')}（合法: ${kinds.join('/')}）`);
+                problems.push(`STAGE_KIND 有 ${bad.length} 处取值不在 STAGE_TIMEOUT_TIER 里 → 会静默退到 feature 档`);
+            }
+            const stageKeys = [...stagesBlk.matchAll(/^\s*["']?([\w-]+)["']?\s*:\s*\[/gm)].map((m) => m[1]);
+            const undeclared = stageKeys.filter((k) => !(declared || []).some((m) => m[1] === k));
+            if (stageKeys.length && undeclared.length) {
+                console.log(`  ! ${undeclared.length} 个 stage 没登记 STAGE_KIND（按 feature 档）: ${undeclared.slice(0, 6).join(', ')}`);
+                warnings.push(`${undeclared.length} 个 stage 未登记 STAGE_KIND → 一律按 feature 25 分钟，可能过长或过短`);
+            } else if (stageKeys.length) {
+                console.log(`  ✓ ${stageKeys.length} 个 stage 的 STAGE_KIND 都合法`);
+            }
+        }
+    }
+
+    // C11 裁决解析器必须与模板一致（解析器漂移过一次：只认英文 VERDICT，
+    // 6 个「结论：通过」被记成 blocked）。哈希对不上就说明这份 workflow 用了自己的解析器。
+    {
+        const tplPath = path.join(TEMPLATE_DIR, 'workflow.template.js');
+        const grab = (src) => {
+            const a = src.indexOf('function lastDecl(');
+            const b = src.indexOf("return zhVerdict(out) || 'UNKNOWN';");
+            if (a < 0 || b < a) return '';
+            return src.slice(a, src.indexOf('\n};', b) + 3);
+        };
+        const want = fs.existsSync(tplPath) ? grab(fs.readFileSync(tplPath, 'utf8')) : '';
+        const got = grab(wsrc);
+        if (!want) {
+            console.log('  ! 读不到模板解析器 → C11 跳过');
+        } else if (!got) {
+            console.log('  ✗ 本文件没有模板解析器块 → 裁决靠自定义逻辑');
+            problems.push('解析器块缺失 → 裁决由自定义逻辑决定，与模板不一致（历史事故：只认英文 VERDICT，6 个「结论：通过」被记成 blocked）');
+        } else if (got !== want) {
+            const h = (x) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 12);
+            console.log(`  ✗ 解析器与模板不一致（本文件 ${h(got)} / 模板 ${h(want)}）`);
+            problems.push('解析器与模板哈希不一致 → 裁决语义可能已经漂移，请改用模板的 lastDecl/verdictOf');
+        } else {
+            console.log('  ✓ 解析器与模板一致');
+        }
+    }
+
+    // C12 lite 模式的适用边界：省掉的检查是有代价的，越界就必须回标准模式
+    {
+        const mode = (wsrc.match(/const\s+MODE\s*=\s*["']([\w-]+)["']/) || [])[1] || 'standard';
+        if (mode !== 'lite') {
+            console.log(`  ✓ 模式: ${mode}`);
+        } else {
+            const stagesBlk = (wsrc.match(/const\s+STAGES\s*=\s*\{([\s\S]*?)\n\};/) || [])[1] || '';
+            const stageKeys = [...stagesBlk.matchAll(/^\s*["']?([\w-]+)["']?\s*:\s*\[/gm)].map((m) => m[1]);
+            const kindBlk2 = (wsrc.match(/const\s+STAGE_KIND\s*=\s*\{([\s\S]*?)\n?\};/) || [])[1] || '';
+            const kindVals = [...kindBlk2.matchAll(/["']?([\w-]+)["']?\s*:\s*["']([\w-]+)["']/g)].map((m) => m[2]);
+            const ALLOWED = ['skeleton', 'mechanical', 'verify'];
+            const bad6 = kindVals.filter((k) => !ALLOWED.includes(k));
+            // 自己算仓根（C6 的 rootsOf 在另一段作用域里，不可直接复用）
+            const cp = { REPO: '' };
+            for (const m2 of wsrc.matchAll(/const\s+(\w+)\s*=\s*REPO\s*\+\s*"([^"]*)"/g)) cp[m2[1]] = m2[2];
+            const rootOfPath = (q) => {
+                const seg = String(q).replace(/^\/+/, '').split('/').filter(Boolean);
+                if (!seg.length) return '(根仓)';
+                return seg[0] === 'ops' || seg[0] === 'tsp' || seg[0] === 'app' ? seg.slice(0, 2).join('/') : seg[0];
+            };
+            const roots = new Set();
+            for (const k of stageKeys) {
+                const body = (wsrc.match(new RegExp('\\b' + k + '\\s*:\\s*\\[([\\s\\S]*?)\\]\\.join')) || [])[1] || '';
+                const scope = (body.match(/授权范围[：:]\s*([^\n"']*)/) || [])[1] || '';
+                const found = new Set();
+                for (const nm of Object.keys(cp)) {
+                    if (nm === 'REPO') continue;
+                    if (new RegExp('\\b' + nm + '\\b').test(scope)) found.add(rootOfPath(cp[nm]));
+                }
+                for (const m3 of scope.matchAll(/(?:^|[^A-Za-z0-9_.-])((?:ops|tsp|app)\/[\w.-]+)/g)) found.add(rootOfPath(m3[1]));
+                if (!found.size) found.add('(根仓)');
+                for (const r of found) roots.add(r);
+            }
+
+            const errs = [];
+            if (stageKeys.length > 3) errs.push(`stage ${stageKeys.length} 个 > 3`);
+            if (bad6.length) errs.push(`kind 含 ${[...new Set(bad6)].join('/')}（lite 只允许 ${ALLOWED.join('/')}）`);
+            if (roots.size > 1) errs.push(`跨 ${roots.size} 个仓（${[...roots].join(', ')}）`);
+            if (errs.length) {
+                console.log(`  ✗ MODE=lite 但越界: ${errs.join('；')}`);
+                problems.push(
+                    `MODE=lite 不满足适用条件（${errs.join('；')}）→ 换成 standard，或把改动拆小`
+                );
+            } else {
+                console.log(`  ✓ MODE=lite 且未越界（${stageKeys.length} stage / 单仓 / kind 合规）`);
+            }
+        }
+    }
+
     // C8 每个派发点的选项对象必须带超时
+    const MAX_TIMEOUT_MS = 25 * 60 * 1000;
     const dispatch = [];
     for (const m of wsrc.matchAll(/\bagent\s*:\s*["']/g)) {
         const start = wsrc.lastIndexOf('{', m.index);
@@ -190,7 +353,18 @@ function checkDispatchContract(wsrc) {
         if (end < 0) continue;
         const obj = wsrc.slice(start, end + 1);
         const line = wsrc.slice(0, start).split('\n').length;
-        dispatch.push({ line, hasTimeout: /(?:maxRuntimeMs|timeoutMs)\s*:/.test(obj) });
+        const tm = obj.match(/(?:maxRuntimeMs|timeoutMs)\s*:\s*([^,\n}]+)/);
+        let tooLong = false;
+        if (tm) {
+            const expr = tm[1].trim();
+            // 只判字面量：STAGE_TIMEOUT_TIER 这类表达式由 C10 管
+            const mm = expr.match(/^(\d+)\s*\*?\s*(\d*)\s*\*?\s*(\d*)$/);
+            if (mm) {
+                const v = Number(mm[1]) * (Number(mm[2]) || 1) * (Number(mm[3]) || 1);
+                if (Number.isFinite(v) && v > MAX_TIMEOUT_MS) tooLong = true;
+            }
+        }
+        dispatch.push({ line, hasTimeout: Boolean(tm), tooLong });
     }
     if (!dispatch.length) {
         console.log('  ! 未识别到派发点（可能用了自定义派发路径），C8 跳过');
@@ -205,6 +379,13 @@ function checkDispatchContract(wsrc) {
         } else {
             console.log(`  ✓ ${dispatch.length} 个派发点都带超时`);
         }
+        const tooLong = dispatch.filter((d) => d.tooLong);
+        if (tooLong.length) {
+            console.log(`  ✗ ${tooLong.length} 个派发点超时字面量 > 25 分钟（行 ${tooLong.map((d) => d.line).join(', ')}）`);
+            problems.push(
+                `${tooLong.length} 个派发点写了 > 25 分钟的超时字面量 → 卡住一次的代价不可接受。按 STAGE_TIMEOUT_TIER 取档位`
+            );
+        }
     }
 }
 
@@ -212,13 +393,21 @@ function checkDispatchContract(wsrc) {
 // 手写变体（const TASK / 模板字符串 / 对象而非数组）解析不到 stageBlocks，
 // 那时若继续跑覆盖逻辑，会报「N 个单元无人认领」这种**假结论**——比没有结论更危险。
 const shapeOk = wavesBlock && Object.keys(stageBlocks).length > 0;
-if (!shapeOk && dcProblems.length) {
+if (!shapeOk) {
+    // PARTIAL：形状不认识，覆盖矩阵不判；但派发契约/解析器这些与形状无关的结论照报。
+    // 退回 exit 2 而不是 1 —— 这**不是**「全部合格」，是「只判了一部分」。
     console.error('');
-    console.error('✗ 派发契约不达标（与文件形状无关，确定的事实）：');
-    for (const p of dcProblems) console.error('  - ' + p);
+    console.error('◐ PARTIAL：只判了与文件形状无关的部分，覆盖矩阵未判。');
+    if (dcProblems.length) {
+        console.error('');
+        console.error('  确定问题 ' + dcProblems.length + ' 条：');
+        for (const p of dcProblems) console.error('  - ' + p);
+    } else {
+        console.error('  形状无关检查全部通过（但这不能证明覆盖闭合）。');
+    }
     console.error('');
-    console.error('  （覆盖矩阵未判：本文件不是模板形状，需人工核）');
-    process.exit(1);
+    console.error('  → 按 SKILL.md：PARTIAL 不得据此派发，除非用户明确豁免。');
+    process.exit(2);
 }
 if (!shapeOk) {
     console.error('✗ 无法解析此文件的结构，不做覆盖判断，也不出结论。');

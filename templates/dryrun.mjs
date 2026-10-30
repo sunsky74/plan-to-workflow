@@ -39,7 +39,26 @@ const firstStageAfter = (mIdx) => {
 // ── 执行器
 const fn = new Function('runs', 'args', 'return (async () => {' + src + '})()');
 
+// 注入的失败形态：blocked | timeout | timeout-once（第一次超时，续跑成功）
+const seen = {};
+const seenG = {};
+function injectImpl(failStages, seenMap, key) {
+    const st = key.split('-impl-')[0];
+    const v = failStages && failStages[st];
+    if (!v) return null;
+    if (v === 'blocked') return { ok: true, output: 'STATUS: BLOCKED 测试注入' };
+    if (v === 'timeout') return { ok: false, failureKind: 'timeout', output: '' };
+    if (v === 'timeout-once') {
+        seenMap[st] = (seenMap[st] || 0) + 1;
+        return seenMap[st] === 1 ? { ok: false, failureKind: 'timeout', output: '' } : null;
+    }
+    return null;
+}
+
 async function run(label, args, failStages) {
+    const events = [];
+    for (const k of Object.keys(seen)) delete seen[k];
+    for (const k of Object.keys(seenG)) delete seenG[k];
     const log = [];
     const runs = {
         all: async (specs) =>
@@ -48,11 +67,26 @@ async function run(label, args, failStages) {
                 const isGate = x.key.includes('-gate-') || x.key.startsWith('final-');
                 if (isGate) {
                     const st = x.key.startsWith('final-') ? x.key : x.key.split('-gate-')[0];
-                    if (failStages && failStages[st]) return { ok: true, output: 'VERDICT: FAIL' };
+                    if (failStages && failStages[st] === 'timeout-once') {
+                        seenG[st] = (seenG[st] || 0) + 1;
+                        if (seenG[st] === 1) return { ok: false, failureKind: 'timeout', output: '' };
+                    }
+                    if (failStages && failStages[st] === 'unknown-once') {
+                        seenG[st] = (seenG[st] || 0) + 1;
+                        if (seenG[st] === 1) return { ok: true, output: '门禁通过了，但…' };
+                    }
+                    if (failStages && failStages[st] === 'timeout') {
+                        return { ok: false, failureKind: 'timeout', output: '' };
+                    }
+                    const gv = failStages && failStages[st];
+                    if (gv && gv !== 'timeout' && gv !== 'timeout-once' && gv !== 'unknown-once') {
+                        return { ok: true, output: 'VERDICT: FAIL' };
+                    }
                     return { ok: true, output: 'VERDICT: PASS' };
                 }
-                if (failStages && failStages[x.key.split('-impl-')[0]] === 'blocked') {
-                    return { ok: true, output: 'STATUS: BLOCKED 测试注入' };
+                {
+                    const inj = injectImpl(failStages, seen, x.key);
+                    if (inj) return inj;
                 }
                 return { ok: true, output: 'STATUS: DONE' };
             }),
@@ -63,7 +97,7 @@ async function run(label, args, failStages) {
     };
     let r, err = null;
     try {
-        r = await fn(runs, args);
+        r = await fn(runs, args, (ev) => events.push(ev));
     } catch (e) {
         err = e;
         r = { halted: 'THREW', reason: e.message, progress: [] };
@@ -76,6 +110,8 @@ async function run(label, args, failStages) {
         children: log.length,
         halted: r.halted,
         nextManual: r.nextManual || '',
+        resumes: r.resumes || [],
+        events,
         reason: String(r.reason || ''),
         err
     };
@@ -134,6 +170,40 @@ const lastFail = results.find((r) => r.label.includes('门禁一直 FAIL'));
 if (lastFail && lastFail.stages.length === 0) bad.push('门禁 FAIL 场景没跑到目标 stage');
 const blockedRun = results.find((r) => r.label.includes('BLOCKED'));
 if (blockedRun && blockedRun.nextManual) bad.push('实现者 BLOCKED 时应停机报人，不应继续到人工段');
+
+// —— A2 超时分档 / 续跑
+results.push(await run('实现超时 → 续跑成功', { fromStage: lastStage, manualDone: lastM }, { [lastStage]: 'timeout-once' }));
+const res1 = results[results.length - 1];
+if (res1.halted) bad.push('实现超时续跑成功后仍 halted：' + (res1.reason || ''));
+if (!res1.resumes || !res1.resumes.length) bad.push('实现超时后没有记录续跑');
+
+results.push(await run('实现超时 → 续跑仍超时 → 停机', { fromStage: lastStage, manualDone: lastM }, { [lastStage]: 'timeout' }));
+const res2 = results[results.length - 1];
+if (!res2.halted) bad.push('续跑仍超时却没收手');
+
+results.push(await run('实现非超时失败 → 直接停机不续跑', { fromStage: lastStage, manualDone: lastM }, { [lastStage]: 'blocked' }));
+const res3 = results[results.length - 1];
+if ((res3.resumes || []).length) bad.push('非超时失败不该续跑');
+
+results.push(await run('门禁超时 → 重派 → PASS', { fromStage: lastStage, manualDone: lastM }, { [lastStage]: 'timeout-once' }));
+const res4 = results[results.length - 1];
+if (res4.halted && /门禁/.test(res4.reason || '')) bad.push('门禁超时重派后仍按失败停了');
+
+results.push(await run('门禁首次 UNKNOWN → 重派 → PASS', { fromStage: lastStage, manualDone: lastM }, { [lastStage]: 'unknown-once' }));
+const res5 = results[results.length - 1];
+if (res5.halted) bad.push('门禁 UNKNOWN 重派后仍停机：' + (res5.reason || ''));
+if (!(res5.resumes || []).some((x) => x.reason === 'gate-unknown')) bad.push('UNKNOWN 没有触发格式重派');
+
+// —— A4 进度事件必须成对，且不留悬空的 stage-start
+{
+    const paid = results.filter((r) => r.label.includes('全新开跑') || r.label.includes('门禁超时'));
+    for (const r of paid) {
+        const starts = r.events.filter((e) => e.type === 'stage-start').map((e) => e.stage);
+        const ends = r.events.filter((e) => e.type === 'stage-end').map((e) => e.stage);
+        if (starts.length !== ends.length) bad.push(`${r.label}: stage-start ${starts.length} 个 / stage-end ${ends.length} 个`);
+        for (const s of new Set(starts)) if (!ends.includes(s) && !r.halted) bad.push(`${r.label}: ${s} 有 start 无 end`);
+    }
+}
 
 console.log('\n' + (bad.length ? '✗ 干跑发现问题:\n  - ' + bad.join('\n  - ') : '✓ 干跑通过：跳层、人工段放行、门禁收敛、BLOCKED 停机都符合预期'));
 process.exit(bad.length ? 1 : 0);

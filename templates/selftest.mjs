@@ -33,6 +33,16 @@ const ok = (name, cond, detail) => {
     }
 };
 
+// 跑任意可执行文件（run-bounded.sh 这类不是 node 脚本）
+const sh = (file, args, extra = {}) => {
+    try {
+        const out = execFileSync(file, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...extra });
+        return { code: 0, out };
+    } catch (e) {
+        return { code: e.status ?? -1, out: `${e.stdout || ''}${e.stderr || ''}` };
+    }
+};
+
 const run = (file, args) => {
     try {
         const out = execFileSync('node', [file, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -91,7 +101,13 @@ function fixture(name, opt = {}) {
     ]
         .filter(Boolean)
         .join('\n');
-    fs.writeFileSync(path.join(dir, 'wf.js'), js);
+    // 真实产物是「模板 + 填内容」，所以一定带模板解析器块；fixture 也带上，
+    // 否则 C11 会把每个 fixture 都当成「自定义解析器」。
+    const tplSrc = fs.readFileSync(path.join(HERE, 'workflow.template.js'), 'utf8');
+    const pa = tplSrc.indexOf('function lastDecl(');
+    const pb = tplSrc.indexOf("return zhVerdict(out) || 'UNKNOWN';");
+    const parser = pa >= 0 && pb > pa ? tplSrc.slice(pa, tplSrc.indexOf('\n};', pb) + 3) : '';
+    fs.writeFileSync(path.join(dir, 'wf.js'), js + '\n' + parser + '\n');
     fs.writeFileSync(path.join(dir, 'tasks.md'), opt.tasks || '- [ ] 1.1 造个东西\n');
     if (opt.profile) fs.writeFileSync(path.join(dir, 'profile.md'), opt.profile);
     return dir;
@@ -193,9 +209,29 @@ const runTpl = async (args, implOut) => {
     return await fn(runs, args);
 };
 {
+    // A5: lite 只派总门禁 A —— 把模板副本里的 MODE 改掉再跑同一套假 runs
+    const liteSrc = TPL_SRC.replace('const MODE = "standard";', 'const MODE = "lite";');
+    ok('模板的 MODE 常量可被替换（测试自身有效性）', liteSrc !== TPL_SRC);
+    const log = [];
+    const fn = new Function('runs', 'args', 'return (async () => {' + liteSrc + '})()');
+    const runs = {
+        all: async (specs) => {
+            for (const x of specs) log.push(x.key);
+            return specs.map((x) => ({ ok: true, output: x.key.includes('-gate-') ? 'VERDICT: PASS' : 'STATUS: DONE' }));
+        }
+    };
+    const lastStage = ['s1', 's2', 's3', 's4'].filter((x) => TPL_SRC.includes(x)).pop() || 's1';
+    await fn(runs, { manualDone: ['M1', 'M2', 'M3', 'M4', 'M5'] });
+    const finals = log.filter((k) => k.startsWith('final-'));
+    ok('lite 模式不派总门禁 B', !finals.includes('final-b'), '派了: ' + finals.join(','));
+    ok('lite 模式仍派总门禁 A', finals.includes('final-a'), '派了: ' + finals.join(','));
+}
+
+{
     // T8: fromStage 认层内任意成员。只认 wave[0] 时，传层内其它 stage 会静默跳过整条链。
     const r = await runTpl({ fromStage: 's3', manualDone: ['M1'] }, 'STATUS: DONE');
-    const ran = [...new Set(r.progress.map((x) => x.split(' ')[0]))];
+    // progress 行现在是 4 列表格：| 时刻 | stage | 结果 | 备注 |
+    const ran = [...new Set(r.progress.map((x) => String(x).split('|').map((c) => c.trim())[2]))];
     ok('fromStage 传层内非首成员仍跑该层', ran.includes('s3') && ran.includes('s2'), '跑到: ' + JSON.stringify(ran));
 
     // T9: worker 引用规则原文不得被判 BLOCKED（indexOf 全文匹配的经典误判）
@@ -278,6 +314,180 @@ const runTpl = async (args, implOut) => {
     ok('progress.md 结果列不合规被拦住', /格式不符/.test(r2.out) && r2.code === 1);
 }
 
+// ── T17 verdict 解析：直接从模板里抠出解析器本体来测（不是复写一份）
+{
+    const src = fs.readFileSync(path.join(SKILL, 'templates', 'workflow.template.js'), 'utf8');
+    const a = src.indexOf('function lastDecl(');
+    const b = src.indexOf("return zhVerdict(out) || 'UNKNOWN';");
+    ok('能定位模板里的解析器块', a > 0 && b > a);
+    let P = null;
+    if (a > 0 && b > a) {
+        const end = src.indexOf('\n};', b) + 3;
+        const block = src.slice(a, end);
+        P = new Function(block + '\nreturn { verdictOf, isBlocked, lastDecl };')();
+    }
+    if (P) {
+        const cases = [
+            ['VERDICT: PASS', 'PASS', '英文 VERDICT'],
+            ['- 结论：通过', 'PASS', '行首中文（真实事故形态）'],
+            ['判定：不通过', 'FAIL', '行首中文 FAIL'],
+            ['门禁结论：需裁决', 'BLOCKED', '行首中文 BLOCKED'],
+            ['门禁通过了，但…', 'UNKNOWN', '中文不在行首 → 不认（避免句中误判）'],
+            ['VERDICT: PASS\nRESULT_JSON: {"verdict":"FAIL"}', 'FAIL', 'RESULT_JSON 优先于 VERDICT'],
+            ['VERDICT: PASS\nRESULT_JSON: {坏 JSON}', 'PASS', '非法 JSON 回退到 VERDICT'],
+            ['没人写裁决', 'UNKNOWN', '什么都没有 → UNKNOWN'],
+            ['VERDICT: PASS\n\n若无法判断则写 VERDICT: FAIL\n\n谢谢', 'PASS', '行首最后一条生效'],
+            ['STATUS: DONE\n正文曾引用 STATUS: BLOCKED', '', '引用不能盖过末行']
+        ];
+        for (const [out, want, label] of cases) {
+            const got = label.startsWith('引用') ? (P.isBlocked(out) ? 'BLOCKED' : '') : P.verdictOf(out);
+            ok(`verdict 解析：${label}`, got === want, `got=${got} want=${want}`);
+        }
+        // 真实 fixture：reviewer 写「结论：通过」
+        const inc = path.join(SKILL, 'fixtures', 'incidents', '2026-10-29-alert-center');
+        const f1 = path.join(inc, 'verdict-zh.txt');
+        if (fs.existsSync(f1)) {
+            ok('真实件 verdict-zh.txt 判为 PASS', P.verdictOf(fs.readFileSync(f1, 'utf8')) === 'PASS');
+        }
+        const f2 = path.join(inc, 'verdict-quote.txt');
+        if (fs.existsSync(f2)) {
+            const t = fs.readFileSync(f2, 'utf8');
+            ok('真实件 verdict-quote.txt：正文引用 BLOCKED 不算本次结论',
+                P.isBlocked(t) === false && P.lastDecl(t, 'STATUS') === 'DONE',
+                `isBlocked=${P.isBlocked(t)} lastDecl=${P.lastDecl(t, 'STATUS')}`);
+        }
+    }
+}
+
+// ── T16b append-progress：幂等 + 表格形态
+{
+    const dir = fixture('progress-append', {});
+    const st = path.join(dir, 'status.json');
+    const rows = ['| 2026-10-29 10:00 | s1 | PASS r1 | ok |', '| 2026-10-29 10:05 | s2 | FAIL r1 | 漏 3 处 |'];
+    fs.writeFileSync(st, JSON.stringify({ value: { progress: rows } }));
+    const AP = path.join(HERE, 'append-progress.mjs');
+
+    const r1 = run(AP, [dir, st]);
+    ok('append-progress 首次写入', r1.code === 0 && fs.existsSync(path.join(dir, 'progress.md')), r1.out.slice(0, 80));
+    const after1 = fs.readFileSync(path.join(dir, 'progress.md'), 'utf8');
+    ok('append-progress 写出 4 列表头', /\| 时刻 \| stage \/ 段 \| 结果 \| 备注 \|/.test(after1));
+
+    const r2 = run(AP, [dir, st]);
+    const after2 = fs.readFileSync(path.join(dir, 'progress.md'), 'utf8');
+    ok('append-progress 幂等（同一 status 跑两次不重复）', r2.code === 0 && after1 === after2, r2.out.slice(0, 60));
+
+    // 新格式行能被 coverage 的台账检查解析
+    const r3 = run(path.join(HERE, 'coverage.mjs'), [path.join(dir, 'tasks.md'), path.join(dir, 'wf.js'), path.join(dir, 'actions.md')]);
+    // actions.md 不存在 → 台账检查不触发；此处只断言 coverage 不因 progress.md 报格式错
+    ok('coverage 不把新格式台账判成格式错', !/progress\.md 有 .* 行格式不符/.test(r3.out));
+}
+
+// ── T18 有界执行器：run-bounded.sh
+{
+    const BIN = path.join(HERE, 'bin', 'run-bounded.sh');
+    ok('run-bounded.sh 存在且可执行', fs.existsSync(BIN) && (fs.statSync(BIN).mode & 0o111) !== 0);
+
+    if (fs.existsSync(BIN)) {
+        // 1) 正常结束 → 0
+        const r1 = sh('bash', [BIN, '5', '--', 'true']);
+        ok('run-bounded 正常结束返回 0', r1.code === 0, `code=${r1.code}`);
+
+        // 2) 超时 → 124，且 sleep 已被杀
+        const pidFile = path.join(TMP, 'sleep.pid');
+        const t0 = Date.now();
+        const r2 = sh('bash', [BIN, '2', '--', 'bash', '-c', `echo $$ > ${pidFile}; sleep 30`]);
+        const el = Date.now() - t0;
+        ok('run-bounded 超时返回 124', r2.code === 124, `code=${r2.code}`);
+        ok('run-bounded 到点就杀（不等满 30s）', el < 12000, `${el}ms`);
+        const pid = (fs.existsSync(pidFile) ? fs.readFileSync(pidFile, 'utf8') : '').trim();
+        let alive = true;
+        try { process.kill(Number(pid), 0); } catch { alive = false; }
+        ok('run-bounded 超时后子进程真的没了', pid !== '' && !alive, `pid=${pid} alive=${alive}`);
+
+        // 3) --until 命中 → 0，且子进程被杀
+        const logf = path.join(TMP, 'svc.log');
+        const pidFile2 = path.join(TMP, 'svc.pid');
+        if (fs.existsSync(logf)) fs.unlinkSync(logf);
+        const r3 = sh('bash', [
+            BIN, '20', '--until', 'READY', '--log', logf, '--',
+            // 真实形态：服务自己往日志文件里写，--until 读的是那个文件
+            'bash', '-c', `echo $$ > ${pidFile2}; echo booting >> ${logf}; sleep 1; echo READY >> ${logf}; sleep 30`
+        ]);
+        ok('run-bounded --until 命中返回 0', r3.code === 0, `code=${r3.code} out=${r3.out.slice(0, 80)}`);
+        const pid2 = (fs.existsSync(pidFile2) ? fs.readFileSync(pidFile2, 'utf8') : '').trim();
+        let alive2 = true;
+        try { process.kill(Number(pid2), 0); } catch { alive2 = false; }
+        ok('run-bounded --until 命中后子进程被杀', pid2 !== '' && !alive2, `pid=${pid2} alive=${alive2}`);
+
+        // 4) 整个进程组一起杀（孙进程也不能留）
+        const pidDir = path.join(TMP, 'pgpids');
+        fs.mkdirSync(pidDir, { recursive: true });
+        const r4 = sh('bash', [
+            BIN, '2', '--',
+            'bash', '-c', `echo $$ > ${pidDir}/a; ( echo $$ > ${pidDir}/b; sleep 30 ) & sleep 30`
+        ]);
+        ok('run-bounded 超时（进程组）返回 124', r4.code === 124, `code=${r4.code}`);
+        let aliveCount = 0;
+        for (const f of fs.readdirSync(pidDir)) {
+            const q = fs.readFileSync(path.join(pidDir, f), 'utf8').trim();
+            try { process.kill(Number(q), 0); aliveCount++; } catch { /* dead */ }
+        }
+        ok('run-bounded 杀掉整个进程组（含孙进程）', aliveCount === 0, `still alive: ${aliveCount}`);
+    }
+}
+
+// ── T19 C9：常驻命令必须被拦住
+{
+    const bad = fixture('c9-bad', {
+        rules: 'full',
+        dispatch: 'timeout',
+        stages: { s1: '范围：tasks.md 1.1 改造|自检：以 test profile 启动 service 上下文并记录结果' }
+    });
+    const r = cov(bad, false);
+    ok('C9 拦住「启动 service 上下文」', r.code === 1 && /常驻|run-bounded/.test(r.out),
+        `code=${r.code} ` + r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+    const bad2 = fixture('c9-bad2', {
+        rules: 'full',
+        dispatch: 'timeout',
+        stages: { s1: '范围：tasks.md 1.1 改造|自检：mvn spring-boot:run 后看日志' }
+    });
+    const r2 = cov(bad2, false);
+    ok('C9 拦住 spring-boot:run', r2.code === 1 && /spring-boot:run/.test(r2.out),
+        `code=${r2.code}`);
+
+    // 真实事故原文：s3 的自检语句（逐字）
+    const inc = path.join(SKILL, 'fixtures', 'incidents', '2026-10-29-alert-center', 's3-stage.txt');
+    if (fs.existsSync(inc)) {
+        const s3 = fs.readFileSync(inc, 'utf8').trim();
+        const d = fixture('c9-incident', {
+            rules: 'full', dispatch: 'timeout',
+            stages: { s1: '范围：tasks.md 1.1 改造|' + s3 }
+        });
+        const rr = cov(d, false);
+        ok('C9 拦住真实事故原文（s3-stage.txt）', rr.code === 1 && /常驻进程/.test(rr.out),
+            rr.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+        // 同一句改成有界写法就该放行
+        const d2 = fixture('c9-incident-fixed', {
+            rules: 'full', dispatch: 'timeout',
+            stages: { s1: '范围：tasks.md 1.1 改造|自检：用 run-bounded.sh 60 --until "Started .*Application" --log app.log -- mvn spring-boot:run' }
+        });
+        const rr2 = cov(d2, false);
+        ok('C9 放行真实事故的有界改法', rr2.code === 0,
+            rr2.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+    }
+
+    const good = fixture('c9-good', {
+        rules: 'full',
+        dispatch: 'timeout',
+        stages: { s1: '范围：tasks.md 1.1 改造|自检：使用 run-bounded.sh --until READY -- ./start.sh 证明能启动' }
+    });
+    const r3 = cov(good, false);
+    ok('C9 放行 run-bounded.sh 的写法', r3.code === 0,
+        `code=${r3.code} ` + r3.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+}
+
 // T15b: 形状闸门之前也要跑派发契约 —— 手写变体恰是最容易转圈的那一类
 {
     const d = fixture('handwritten', {});
@@ -289,8 +499,68 @@ const runTpl = async (args, implOut) => {
         'const SPEC = [{ key: "a", agent: "worker", task: "t" }];\n'
     );
     const r = cov(d, false);
-    ok('手写变体也查派发超时（不被形状闸门吞掉）', r.code === 1 && /缺 maxRuntimeMs/.test(r.out),
+    // 手写变体走 PARTIAL（exit 2）：形状无关的问题照报，但覆盖矩阵不判
+    ok('手写变体走 PARTIAL 且照报派发超时',
+        r.code === 2 && /PARTIAL/.test(r.out) && /缺 maxRuntimeMs/.test(r.out),
         `code=${r.code} ` + r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+    ok('手写变体缺解析器被判 C11', /解析器块缺失/.test(r.out));
+}
+
+// T22 C12：lite 模式的边界
+{
+    const mk = (name, stages, kind) => {
+        const d = fixture(name, { rules: 'full', dispatch: 'timeout', stages });
+        fs.appendFileSync(path.join(d, 'wf.js'),
+            '\nconst MODE = "lite";\nconst STAGE_TIMEOUT_TIER = { skeleton: 10, mechanical: 15, verify: 12, feature: 25 };\n' +
+            'const STAGE_KIND = {' + kind + '};\n');
+        return d;
+    };
+
+    const d1 = mk('lite-4stage',
+        { s1: '范围：tasks.md 1.1 a', s2: '范围：tasks.md 1.2 b', s3: '范围：tasks.md 1.3 c', s4: '范围：tasks.md 1.4 d' },
+        's1: "skeleton", s2: "mechanical", s3: "verify", s4: "skeleton"');
+    fs.writeFileSync(path.join(d1, 'wf.js'),
+        fs.readFileSync(path.join(d1, 'wf.js'), 'utf8').replace('const WAVES = [\n    ["s1"],\n];', 'const WAVES = [\n    ["s1"],\n];'));
+    const r1 = cov(d1, false);
+    ok('C12 lite 超过 3 个 stage 被拦住', r1.code === 1 && /lite 不满足适用条件/.test(r1.out),
+        r1.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+    const d2 = mk('lite-feature', { s1: '范围：tasks.md 1.1 a' }, 's1: "feature"');
+    const r2 = cov(d2, false);
+    ok('C12 lite 含 feature 档被拦住', r2.code === 1 && /kind 含 feature/.test(r2.out),
+        r2.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+    const d3 = mk('lite-ok', { s1: '范围：tasks.md 1.1 a' }, 's1: "mechanical"');
+    const r3 = cov(d3, false);
+    ok('C12 lite 合规时通过', r3.code === 0 && /MODE=lite 且未越界/.test(r3.out),
+        r3.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+}
+
+// T20 C10：STAGE_KIND 取值与登记
+{
+    const d = fixture('kind-bad', { rules: 'full', dispatch: 'timeout' });
+    fs.appendFileSync(path.join(d, 'wf.js'),
+        '\nconst STAGE_TIMEOUT_TIER = { skeleton: 10, feature: 25 };\nconst STAGE_KIND = { s1: "skelton" };\n');
+    const r = cov(d, false);
+    ok('C10 拦住非法 STAGE_KIND 取值', r.code === 1 && /STAGE_KIND 取值非法/.test(r.out),
+        r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+    const d2 = fixture('kind-missing', { rules: 'full', dispatch: 'timeout' });
+    fs.appendFileSync(path.join(d2, 'wf.js'),
+        '\nconst STAGE_TIMEOUT_TIER = { skeleton: 10, feature: 25 };\nconst STAGE_KIND = { };\n');
+    const r2 = cov(d2, false);
+    ok('C10 未登记的 stage 只警告不阻断', r2.code === 0 && /没登记 STAGE_KIND/.test(r2.out),
+        `code=${r2.code}`);
+}
+
+// T21 C8：硬编码超时 > 25 分钟要拦（分档的意义就在于不许随手写大数）
+{
+    const d = fixture('tmo-long', { rules: 'full', dispatch: 'timeout' });
+    fs.appendFileSync(path.join(d, 'wf.js'),
+        '\nconst SPEC2 = [{ key: "y", agent: "worker", model: MODEL_WORKER, maxRuntimeMs: 90 * 60 * 1000, task: "t" }];\n');
+    const r = cov(d, false);
+    ok('C8 拦住 > 25 分钟的超时字面量', r.code === 1 && /25 分钟的超时字面量/.test(r.out),
+        r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
 }
 
 // T16: 派发契约 —— RULES 缺「验证预算」要拦住（子 agent 转圈的根因）
@@ -353,7 +623,27 @@ ok('模板 revTask 传轮次', /revTask\(g\.stage, g\.output, round\)/.test(tplJ
 ok('模板 revTask 传授权范围', /STAGES\[stage\]/.test(tplJs));
 ok('模板有异常兜底（try/catch + failure）', /catch \(e\)/.test(tplJs) && /failure: failure/.test(tplJs));
 ok('模板 return 带幂等提醒', /不幂等/.test(tplJs));
-ok('模板内置派发超时', /maxRuntimeMs: STAGE_TIMEOUT_MS/.test(tplJs) && /checkpointBeforeDeadlineMs/.test(tplJs));
+ok('模板提供 MODE 常量且 lite 跳过总门禁 B', /const MODE = "standard"/.test(tplJs) && /MODE === "lite" \? gspecs\.slice\(0, 1\)/.test(tplJs));
+ok('SKILL.md 判定卡含「模式」行', /模式: 标准 \| 轻量/.test(skill));
+ok('coverage 有 C12 lite 边界检查', /C12 lite 模式的适用边界/.test(fs.readFileSync(path.join(HERE, 'coverage.mjs'), 'utf8')));
+ok('模板发 stage-start/stage-end 事件且守卫 emit', /typeof emit !== "function"/.test(tplJs) && /notify\("stage-end"/.test(tplJs));
+ok('模板 progress 行是 4 列表格', /\"| \" \+ stamp\(\)/.test(tplJs) || /return \"\| \" \+ stamp/.test(tplJs));
+ok('SKILL.md 要求用 append-progress 记账', /append-progress\.mjs/.test(skill) && /不手改|不要手改/.test(skill));
+ok('SKILL.md 要求逐个通知给状态', /一行状态/.test(skill));
+ok('gates.md 规定末两行 VERDICT + RESULT_JSON', /RESULT_JSON/.test(gates) && /最后两行固定/.test(gates));
+ok('RULES 要求 worker 也给 RESULT_JSON', /RESULT_JSON/.test(tplJs));
+ok('模板：UNKNOWN 重派一次后按 FAIL', /unknownRetried/.test(tplJs) && /verdictStrict/.test(tplJs));
+ok('coverage 有 C11 解析器哈希比对', /C11/.test(fs.readFileSync(path.join(HERE, 'coverage.mjs'), 'utf8')));
+ok('SKILL.md 说明 PARTIAL 不得派发', /PARTIAL 不得据此派发/.test(skill));
+ok('模板按档位取超时（STAGE_TIMEOUT_TIER + STAGE_KIND）', /STAGE_TIMEOUT_TIER/.test(tplJs) && /timeoutMsOf\(s\)/.test(tplJs) && /GATE_TIMEOUT_MS/.test(tplJs));
+ok('模板超时后自动续跑一次', /resumed\[s\]/.test(tplJs) && /-resume/.test(tplJs));
+ok('模板门禁超时重派一次', /gateResumed\[g\.stage\]/.test(tplJs));
+ok('SKILL.md 编排表有「类型」列并解释超时分档', /\*\*类型\*\*决定/.test(skill) && /STAGE_TIMEOUT_TIER/.test(skill));
+ok('模板 RULES 指向 run-bounded.sh', /run-bounded\.sh/.test(tplJs));
+ok('画像第 1 项含「有界执行工具」', /有界执行工具/.test(profileT));
+ok('SKILL.md 规定 stage 自检不得起常驻进程', /不得要求启动常驻进程/.test(skill));
+ok('run-bounded.sh 已随 skill 分发', fs.existsSync(path.join(HERE, 'bin', 'run-bounded.sh')));
+ok('模板内置派发超时（按档位）', /maxRuntimeMs: budget\.ms/.test(tplJs) && /checkpointBeforeDeadlineMs: budget\.checkpoint/.test(tplJs) && /GATE_TIMEOUT_MS/.test(tplJs));
 ok('SKILL.md 记录了子 agent 自转圈的两道闸', /自证验证器/.test(skill) && /maxRuntimeMs/.test(skill));
 ok('模板提供 STAGE_MODEL 正门', /const STAGE_MODEL = \{\};/.test(tplJs) && /STAGE_MODEL\[s\] \|\| MODEL_WORKER/.test(tplJs));
 ok('SKILL.md 要求 plan.md 落盘', /plan\.md/.test(skill) && /scope:/.test(skill));
