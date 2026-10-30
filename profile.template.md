@@ -19,6 +19,7 @@
 | # | 项 | 取证方式（必须真做） |
 |---|---|---|
 | 1 | 构建与自检 | 读构型文件（`pom.xml` / `package.json` / `pyproject.toml` / `Makefile` / `go.mod` / `Cargo.toml`）→ **真跑一次最短自检命令**，把真实输出和已知基线失败记下来 |
+| 1b | 有界执行工具 | `command -v timeout gtimeout` → 记下可用的是哪个；**都没有就写「仅 run-bounded.sh」**。这一项决定 stage 自检能不能写 `timeout`，写错会让 worker 用到不存在的命令 |
 | 2 | 仓 / 模块拓扑 | 列顶层目录 + 判单仓还是多仓（`.git`、workspaces、gradle 多模块、submodule）→ 确认哪些单元能独立构建；**任务单里的简称要逐一对上路径**（见下） |
 | 3 | 条款源 | 找规范类文件（`AGENTS.md` / `CONTRIBUTING` / `docs/**` / spec / adr / 任务单目录）。**找不到就显式写「无」并指定替代源**，不要留空 |
 | 4 | 任务单元形态 | 找**一份真实的已完成任务单**，抄它现有的行格式。不要设计一种新格式 |

@@ -278,6 +278,7 @@ M2(改完 SQL) → M3(冒烟)：期间菜单/角色接口 500，可接受
    三次独立产出（两份手写、一份按本 skill 生成）三次都违反这一条 —— 它不能靠「记得」，只能靠机检。
 2. **`SKILL_DIR` 必须由 `REPO` 拼出**：`REPO + "/.agents/skills/plan-to-workflow"`。不填绝对路径，不填 `~/.agents/skills/...` 这类软链路径。软链一断，所有 gate 静默读不到 `gates.md` —— 而读不到判据不会报错，只会自由发挥。
 3. **stage 编号必须连续。** 删掉一个 stage 后要重编号，不留空号。跳号**不阻断**（只报警告），但它意味着有过删除 —— 覆盖矩阵闭合**不能**证明被删 stage 的工作没一起消失，要人工确认。
+4. **stage 自检不得要求启动常驻进程。** 写「启动 service 上下文并记录结果」等于让 worker 去跑一个不会返回的命令 —— 真实事故里它挂死 51 分钟，而命令其实早已成功。要证明「能起来」只能写 `run-bounded.sh 60 --until 'Started .*Application' --log app.log -- <启动命令>`，它到点杀整个进程组并按命中/超时返回。`coverage` 的 C9 会扫 `RULES/STAGES/GATES/DOCS` 里的常驻命令（`spring-boot:run`、`tail -f`、`npm start`、`docker compose up`、「启动…服务/上下文/应用」），同一行出现 `run-bounded.sh` 才放行。
 
 **其余规则**
 

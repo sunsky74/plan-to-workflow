@@ -148,6 +148,51 @@ const dcProblems = problems.splice(dcBefore);
 // ── C7 / C8 · 派发契约（防止「子 agent 自己转圈」把整轮拖住）
 // 实测：一次卡在自写验证脚本的假 FAIL 上 49 分钟，一次卡在不返回的 spring-boot:run 上 51 分钟。
 // 两条都可预防：规则写进 worker 会读的 RULES，超时写进每次派发。
+// C9 常驻命令：stage 自检里不许出现「起服务并等它」这类不会返回的动作。
+// 实测事故：s3 自检写「以 test profile 启动 service 上下文」，worker 用了
+// `mvn spring-boot:run`，命令本身成功了却永不退出 → bash 卡死 51 分钟。
+
+
+function checkDwell(wsrc) {
+    const DWELL = [
+        ['spring-boot:run', /spring-boot:run/],
+        ['java -jar（前台起服务）', /java\s+-jar\s/],
+        ['npm start / npm run dev', /npm\s+(?:start|run\s+dev)\b/],
+        ['tail -f', /tail\s+-[fF]\b/],
+        ['nc -l', /\bnc\s+-l\b/],
+        ['docker run / compose up（前台）', /docker\s+(?:run\b|compose\s+up\b)/],
+        ['启动服务/上下文/应用', /(?:启动|起)[^。；\n]{0,6}(?:服务|service|上下文|应用)/i]
+    ];
+    // 扫 RULES / STAGES / GATES / DOCS 里给 worker 和 gate 看的字符串
+    const zones = [];
+    for (const m of wsrc.matchAll(/(?:const|let)\s+(RULES|STAGES|GATES|DOCS)\s*=\s*([\s\S]*?)\n(?:const|let|function|\/\/|$)/g)) {
+        zones.push({ name: m[1], body: m[2] });
+    }
+    if (!zones.length) {
+        console.log('  ! 未识别到 RULES/STAGES/GATES/DOCS → C9 无法验证');
+        warnings.push('未识别到约束块 → 无法确认 stage 自检里没有常驻命令；请人工核对');
+        return [];
+    }
+
+    const hits = [];
+    for (const z of zones) {
+        // 逐行看，行号才定位得准
+        const lines = z.body.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            // 放行：显式说明用有界执行器
+            if (/run-bounded\.sh/.test(line)) continue;
+            for (const [label, re] of DWELL) {
+                if (re.test(line)) {
+                    hits.push(`${z.name} 第 ${i + 1} 行：${label}`);
+                    break;
+                }
+            }
+        }
+    }
+    return hits;
+}
+
 function checkDispatchContract(wsrc) {
     console.log('\n── 派发契约 ──');
 
@@ -175,6 +220,18 @@ function checkDispatchContract(wsrc) {
         } else {
             console.log('  ✓ RULES 含验证预算三条（自证 / 最多 2 次 / 禁常驻）');
         }
+    }
+
+    // C9 常驻命令
+    const dwell = checkDwell(wsrc);
+    if (dwell.length) {
+        console.log(`  ✗ ${dwell.length} 处常驻命令（不会自己返回）：`);
+        for (const d of dwell) console.log('      ' + d);
+        problems.push(
+            `${dwell.length} 处 stage 指令要求起常驻进程（${dwell[0]}）→ worker 会卡在等 bash 返回上。改用 run-bounded.sh --until，或改成读日志`
+        );
+    } else {
+        console.log('  ✓ 未发现常驻命令');
     }
 
     // C8 每个派发点的选项对象必须带超时

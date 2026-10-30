@@ -33,6 +33,16 @@ const ok = (name, cond, detail) => {
     }
 };
 
+// 跑任意可执行文件（run-bounded.sh 这类不是 node 脚本）
+const sh = (file, args, extra = {}) => {
+    try {
+        const out = execFileSync(file, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...extra });
+        return { code: 0, out };
+    } catch (e) {
+        return { code: e.status ?? -1, out: `${e.stdout || ''}${e.stderr || ''}` };
+    }
+};
+
 const run = (file, args) => {
     try {
         const out = execFileSync('node', [file, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -278,6 +288,112 @@ const runTpl = async (args, implOut) => {
     ok('progress.md 结果列不合规被拦住', /格式不符/.test(r2.out) && r2.code === 1);
 }
 
+// ── T18 有界执行器：run-bounded.sh
+{
+    const BIN = path.join(HERE, 'bin', 'run-bounded.sh');
+    ok('run-bounded.sh 存在且可执行', fs.existsSync(BIN) && (fs.statSync(BIN).mode & 0o111) !== 0);
+
+    if (fs.existsSync(BIN)) {
+        // 1) 正常结束 → 0
+        const r1 = sh('bash', [BIN, '5', '--', 'true']);
+        ok('run-bounded 正常结束返回 0', r1.code === 0, `code=${r1.code}`);
+
+        // 2) 超时 → 124，且 sleep 已被杀
+        const pidFile = path.join(TMP, 'sleep.pid');
+        const t0 = Date.now();
+        const r2 = sh('bash', [BIN, '2', '--', 'bash', '-c', `echo $$ > ${pidFile}; sleep 30`]);
+        const el = Date.now() - t0;
+        ok('run-bounded 超时返回 124', r2.code === 124, `code=${r2.code}`);
+        ok('run-bounded 到点就杀（不等满 30s）', el < 12000, `${el}ms`);
+        const pid = (fs.existsSync(pidFile) ? fs.readFileSync(pidFile, 'utf8') : '').trim();
+        let alive = true;
+        try { process.kill(Number(pid), 0); } catch { alive = false; }
+        ok('run-bounded 超时后子进程真的没了', pid !== '' && !alive, `pid=${pid} alive=${alive}`);
+
+        // 3) --until 命中 → 0，且子进程被杀
+        const logf = path.join(TMP, 'svc.log');
+        const pidFile2 = path.join(TMP, 'svc.pid');
+        if (fs.existsSync(logf)) fs.unlinkSync(logf);
+        const r3 = sh('bash', [
+            BIN, '20', '--until', 'READY', '--log', logf, '--',
+            // 真实形态：服务自己往日志文件里写，--until 读的是那个文件
+            'bash', '-c', `echo $$ > ${pidFile2}; echo booting >> ${logf}; sleep 1; echo READY >> ${logf}; sleep 30`
+        ]);
+        ok('run-bounded --until 命中返回 0', r3.code === 0, `code=${r3.code} out=${r3.out.slice(0, 80)}`);
+        const pid2 = (fs.existsSync(pidFile2) ? fs.readFileSync(pidFile2, 'utf8') : '').trim();
+        let alive2 = true;
+        try { process.kill(Number(pid2), 0); } catch { alive2 = false; }
+        ok('run-bounded --until 命中后子进程被杀', pid2 !== '' && !alive2, `pid=${pid2} alive=${alive2}`);
+
+        // 4) 整个进程组一起杀（孙进程也不能留）
+        const pidDir = path.join(TMP, 'pgpids');
+        fs.mkdirSync(pidDir, { recursive: true });
+        const r4 = sh('bash', [
+            BIN, '2', '--',
+            'bash', '-c', `echo $$ > ${pidDir}/a; ( echo $$ > ${pidDir}/b; sleep 30 ) & sleep 30`
+        ]);
+        ok('run-bounded 超时（进程组）返回 124', r4.code === 124, `code=${r4.code}`);
+        let aliveCount = 0;
+        for (const f of fs.readdirSync(pidDir)) {
+            const q = fs.readFileSync(path.join(pidDir, f), 'utf8').trim();
+            try { process.kill(Number(q), 0); aliveCount++; } catch { /* dead */ }
+        }
+        ok('run-bounded 杀掉整个进程组（含孙进程）', aliveCount === 0, `still alive: ${aliveCount}`);
+    }
+}
+
+// ── T19 C9：常驻命令必须被拦住
+{
+    const bad = fixture('c9-bad', {
+        rules: 'full',
+        dispatch: 'timeout',
+        stages: { s1: '范围：tasks.md 1.1 改造|自检：以 test profile 启动 service 上下文并记录结果' }
+    });
+    const r = cov(bad, false);
+    ok('C9 拦住「启动 service 上下文」', r.code === 1 && /常驻|run-bounded/.test(r.out),
+        `code=${r.code} ` + r.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+    const bad2 = fixture('c9-bad2', {
+        rules: 'full',
+        dispatch: 'timeout',
+        stages: { s1: '范围：tasks.md 1.1 改造|自检：mvn spring-boot:run 后看日志' }
+    });
+    const r2 = cov(bad2, false);
+    ok('C9 拦住 spring-boot:run', r2.code === 1 && /spring-boot:run/.test(r2.out),
+        `code=${r2.code}`);
+
+    // 真实事故原文：s3 的自检语句（逐字）
+    const inc = path.join(SKILL, 'fixtures', 'incidents', '2026-10-29-alert-center', 's3-stage.txt');
+    if (fs.existsSync(inc)) {
+        const s3 = fs.readFileSync(inc, 'utf8').trim();
+        const d = fixture('c9-incident', {
+            rules: 'full', dispatch: 'timeout',
+            stages: { s1: '范围：tasks.md 1.1 改造|' + s3 }
+        });
+        const rr = cov(d, false);
+        ok('C9 拦住真实事故原文（s3-stage.txt）', rr.code === 1 && /常驻进程/.test(rr.out),
+            rr.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+
+        // 同一句改成有界写法就该放行
+        const d2 = fixture('c9-incident-fixed', {
+            rules: 'full', dispatch: 'timeout',
+            stages: { s1: '范围：tasks.md 1.1 改造|自检：用 run-bounded.sh 60 --until "Started .*Application" --log app.log -- mvn spring-boot:run' }
+        });
+        const rr2 = cov(d2, false);
+        ok('C9 放行真实事故的有界改法', rr2.code === 0,
+            rr2.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+    }
+
+    const good = fixture('c9-good', {
+        rules: 'full',
+        dispatch: 'timeout',
+        stages: { s1: '范围：tasks.md 1.1 改造|自检：使用 run-bounded.sh --until READY -- ./start.sh 证明能启动' }
+    });
+    const r3 = cov(good, false);
+    ok('C9 放行 run-bounded.sh 的写法', r3.code === 0,
+        `code=${r3.code} ` + r3.out.split('\n').filter((l) => l.startsWith('  - ')).join(' / '));
+}
+
 // T15b: 形状闸门之前也要跑派发契约 —— 手写变体恰是最容易转圈的那一类
 {
     const d = fixture('handwritten', {});
@@ -353,6 +469,10 @@ ok('模板 revTask 传轮次', /revTask\(g\.stage, g\.output, round\)/.test(tplJ
 ok('模板 revTask 传授权范围', /STAGES\[stage\]/.test(tplJs));
 ok('模板有异常兜底（try/catch + failure）', /catch \(e\)/.test(tplJs) && /failure: failure/.test(tplJs));
 ok('模板 return 带幂等提醒', /不幂等/.test(tplJs));
+ok('模板 RULES 指向 run-bounded.sh', /run-bounded\.sh/.test(tplJs));
+ok('画像第 1 项含「有界执行工具」', /有界执行工具/.test(profileT));
+ok('SKILL.md 规定 stage 自检不得起常驻进程', /不得要求启动常驻进程/.test(skill));
+ok('run-bounded.sh 已随 skill 分发', fs.existsSync(path.join(HERE, 'bin', 'run-bounded.sh')));
 ok('模板内置派发超时', /maxRuntimeMs: STAGE_TIMEOUT_MS/.test(tplJs) && /checkpointBeforeDeadlineMs/.test(tplJs));
 ok('SKILL.md 记录了子 agent 自转圈的两道闸', /自证验证器/.test(skill) && /maxRuntimeMs/.test(skill));
 ok('模板提供 STAGE_MODEL 正门', /const STAGE_MODEL = \{\};/.test(tplJs) && /STAGE_MODEL\[s\] \|\| MODEL_WORKER/.test(tplJs));
